@@ -1422,6 +1422,8 @@ func (r *Raft) processRPC(rpc RPC) {
 		r.installSnapshot(rpc, cmd)
 	case *TimeoutNowRequest:
 		r.timeoutNow(rpc, cmd)
+	case *RecoverEntryRequest:
+		r.recoverEntry(rpc, cmd)
 	default:
 		r.logger.Error("got unexpected command",
 			"command", hclog.Fmt("%#v", rpc.Command))

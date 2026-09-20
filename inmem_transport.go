@@ -137,6 +137,18 @@ func (i *InmemTransport) RequestPreVote(id ServerID, target ServerAddress, args 
 	return nil
 }
 
+// RecoverEntry implements WithRecovery.
+func (i *InmemTransport) RecoverEntry(id ServerID, target ServerAddress, args *RecoverEntryRequest, resp *RecoverEntryResponse) error {
+	rpcResp, err := i.makeRPC(target, args, nil, i.timeout)
+	if err != nil {
+		return err
+	}
+
+	out := rpcResp.Response.(*RecoverEntryResponse)
+	*resp = *out
+	return nil
+}
+
 // InstallSnapshot implements the Transport interface.
 func (i *InmemTransport) InstallSnapshot(id ServerID, target ServerAddress, args *InstallSnapshotRequest, resp *InstallSnapshotResponse, data io.Reader) error {
 	rpcResp, err := i.makeRPC(target, args, data, 10*i.timeout)
