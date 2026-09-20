@@ -436,16 +436,15 @@ func TestFileLogStore_DisentangleCrashCorruption_CrashBoundary(t *testing.T) {
 	assert.Equal(t, uint64(7), lastSafe)
 	assert.Empty(t, faulty, "crash entries should not appear as corrupted")
 
-	// Entries 8-10 should be discarded.
-	assert.Equal(t, uint32(7), seg.entryCount)
+	// Entries 8-10 should be discarded, leaving 7 live entries.
+	assert.Len(t, seg.index, 7)
+	assert.Equal(t, uint64(7), seg.maxIndex)
 
-	last, err := store.LastIndex()
-	require.NoError(t, err)
 	// updateGlobalIndexes was called during construction; re-compute.
 	store.mu.Lock()
 	store.updateGlobalIndexes()
 	store.mu.Unlock()
-	last, _ = store.LastIndex()
+	last, _ := store.LastIndex()
 	assert.Equal(t, uint64(7), last)
 }
 
@@ -612,7 +611,8 @@ func TestFileLogStore_RollbackOnFlushFailure(t *testing.T) {
 
 	// Record the segment state before the failing write.
 	store.mu.RLock()
-	segEntryCount := store.active.entryCount
+	segLiveCount := len(store.active.index)
+	segMaxIndex := store.active.maxIndex
 	segDataWritePos := store.active.dataWritePos
 	store.mu.RUnlock()
 
@@ -634,8 +634,10 @@ func TestFileLogStore_RollbackOnFlushFailure(t *testing.T) {
 
 	// Verify in-memory state was rolled back.
 	store.mu.RLock()
-	assert.Equal(t, segEntryCount, store.active.entryCount,
-		"entryCount should be rolled back")
+	assert.Equal(t, segLiveCount, len(store.active.index),
+		"live entry count should be rolled back")
+	assert.Equal(t, segMaxIndex, store.active.maxIndex,
+		"maxIndex should be rolled back")
 	assert.Equal(t, segDataWritePos, store.active.dataWritePos,
 		"dataWritePos should be rolled back")
 	store.mu.RUnlock()
@@ -663,7 +665,7 @@ func TestFileLogStore_RollbackOnFlushFailure(t *testing.T) {
 }
 
 // The data write position is derived from the identifiers rather than stored,
-// so garbage in the header bytes it used to occupy must not affect recovery.
+// so garbage in the reserved header region must not affect recovery.
 func TestFileLogStore_DataWritePosNotReadFromHeader(t *testing.T) {
 	dir, cfg := testConfig(t)
 
@@ -675,7 +677,7 @@ func TestFileLogStore_DataWritePosNotReadFromHeader(t *testing.T) {
 	expected := seg.dataWritePos
 	segPath := seg.path
 
-	// Scribble over the header bytes that previously held dataWritePos.
+	// Scribble over the reserved header region (offsets 36:64).
 	var garbage [8]byte
 	binary.BigEndian.PutUint64(garbage[:], 0xDEADBEEF)
 	_, err = seg.file.WriteAt(garbage[:], 36)
@@ -800,7 +802,7 @@ func TestFileLogStore_PhysicalSeparation(t *testing.T) {
 // Entry frame CRC coverage test
 // --------------------------------------------------------------------------
 
-func TestFileLogStore_EntryCRCCoversLengthAndData(t *testing.T) {
+func TestFileLogStore_EntryCRCCoversTermIndexLengthAndData(t *testing.T) {
 	store := testStore(t)
 
 	l := &Log{Index: 1, Term: 1, Type: LogCommand, Data: []byte("crc-test")}
@@ -815,16 +817,25 @@ func TestFileLogStore_EntryCRCCoversLengthAndData(t *testing.T) {
 	_, err := seg.file.ReadAt(frame, rec.DataOffset)
 	require.NoError(t, err)
 
-	// Verify CRC covers length + data (first payloadEnd bytes).
+	// The stored CRC binds ⟨term, index⟩ to the length+data payload.
 	payloadEnd := entryLenSize + int(rec.DataLen)
 	storedCRC := binary.BigEndian.Uint32(frame[payloadEnd:])
-	computedCRC := crc32.ChecksumIEEE(frame[0:payloadEnd])
-	assert.Equal(t, computedCRC, storedCRC)
+	assert.Equal(t, entryChecksum(rec.Term, rec.Index, frame[0:payloadEnd]), storedCRC)
 
-	// Corrupt the length field and verify CRC fails.
+	// A plain CRC over just the payload must NOT match — the identity binding
+	// is what defends against a misdirected write.
+	assert.NotEqual(t, crc32.ChecksumIEEE(frame[0:payloadEnd]), storedCRC)
+
+	// Corrupting the length field breaks the checksum.
 	frame[0] ^= 0xFF
-	recomputedCRC := crc32.ChecksumIEEE(frame[0:payloadEnd])
-	assert.NotEqual(t, storedCRC, recomputedCRC, "CRC should detect length corruption")
+	assert.NotEqual(t, storedCRC, entryChecksum(rec.Term, rec.Index, frame[0:payloadEnd]),
+		"CRC should detect length corruption")
+
+	// Reading the same bytes under a different index must also fail — this is
+	// the aliasing that the binding prevents.
+	frame[0] ^= 0xFF // restore
+	assert.NotEqual(t, storedCRC, entryChecksum(rec.Term, rec.Index+1, frame[0:payloadEnd]),
+		"CRC should detect reading a frame under the wrong index")
 }
 
 // --------------------------------------------------------------------------
@@ -939,7 +950,7 @@ func TestFileLogStore_RepairEntry_InPlaceLeavesMetadataUntouched(t *testing.T) {
 	require.NotNil(t, seg)
 	before := seg.index[3]
 	writePosBefore := seg.dataWritePos
-	entryCountBefore := seg.entryCount
+	liveCountBefore := len(seg.index)
 
 	// Corrupt entry 3, then repair it with the original.
 	corruptOff := before.DataOffset + int64(entryLenSize) + 1
@@ -956,9 +967,139 @@ func TestFileLogStore_RepairEntry_InPlaceLeavesMetadataUntouched(t *testing.T) {
 
 	assert.Equal(t, before, seg.index[3], "identifier must be unchanged")
 	assert.Equal(t, writePosBefore, seg.dataWritePos, "write position must be unchanged")
-	assert.Equal(t, entryCountBefore, seg.entryCount, "entry count must be unchanged")
+	assert.Equal(t, liveCountBefore, len(seg.index), "live entry count must be unchanged")
 
 	var got Log
 	require.NoError(t, store.GetLog(3, &got))
 	assert.Equal(t, logs[2].Data, got.Data)
+}
+
+// --------------------------------------------------------------------------
+// Regression tests: delete/tombstone semantics across restart
+// --------------------------------------------------------------------------
+
+// A prefix DeleteRange must survive a reopen: the deleted entries stay gone
+// (tombstoned) and the surviving suffix must NOT be wiped by recovery. This
+// guards against the old zeroing scheme, where a zeroed prefix slot looked
+// like a crash boundary and truncated everything after it.
+func TestFileLogStore_DeleteRange_PrefixSurvivesReopen(t *testing.T) {
+	dir, cfg := testConfig(t)
+
+	store1, err := NewFileLogStore(dir, cfg)
+	require.NoError(t, err)
+	require.NoError(t, store1.StoreLogs(testLogs(1, 10)))
+
+	// Compact away the prefix [1,4].
+	require.NoError(t, store1.DeleteRange(1, 4))
+	require.NoError(t, store1.Close())
+
+	store2, err := NewFileLogStore(dir, cfg)
+	require.NoError(t, err)
+	defer store2.Close()
+
+	first, _ := store2.FirstIndex()
+	last, _ := store2.LastIndex()
+	assert.Equal(t, uint64(5), first, "first index must skip the deleted prefix")
+	assert.Equal(t, uint64(10), last, "suffix must not be wiped by recovery")
+
+	// Deleted entries are gone; survivors remain readable.
+	var log Log
+	for i := uint64(1); i <= 4; i++ {
+		assert.ErrorIs(t, store2.GetLog(i, &log), ErrLogNotFound, "deleted entry %d", i)
+	}
+	for i := uint64(5); i <= 10; i++ {
+		require.NoError(t, store2.GetLog(i, &log), "survivor %d", i)
+		assert.Equal(t, i, log.Index)
+	}
+}
+
+// After a partial prefix delete, FirstIndex must report the first LIVE index,
+// not a deleted one.
+func TestFileLogStore_FirstIndexAfterPrefixDelete(t *testing.T) {
+	store := testStore(t)
+	require.NoError(t, store.StoreLogs(testLogs(1, 10)))
+
+	require.NoError(t, store.DeleteRange(1, 3))
+
+	first, _ := store.FirstIndex()
+	assert.Equal(t, uint64(4), first)
+
+	var log Log
+	assert.ErrorIs(t, store.GetLog(3, &log), ErrLogNotFound)
+	require.NoError(t, store.GetLog(4, &log))
+}
+
+// A suffix DeleteRange followed by re-appending the same indexes must not
+// resurrect the deleted entries, and the re-appended data must win — even
+// across a reopen. This guards the unified index-addressed slot scheme.
+func TestFileLogStore_NoResurrectionAfterSuffixDeleteAndReappend(t *testing.T) {
+	dir, cfg := testConfig(t)
+
+	store1, err := NewFileLogStore(dir, cfg)
+	require.NoError(t, err)
+
+	// Original entries 1..10 at term 1.
+	require.NoError(t, store1.StoreLogs(testLogs(1, 10)))
+
+	// Truncate the conflicting suffix [6,10] and re-append with term 2.
+	require.NoError(t, store1.DeleteRange(6, 10))
+	var reappended []*Log
+	for i := uint64(6); i <= 10; i++ {
+		reappended = append(reappended, &Log{
+			Index: i, Term: 2, Type: LogCommand, Data: []byte("v2"),
+		})
+	}
+	require.NoError(t, store1.StoreLogs(reappended))
+
+	assertV2 := func(store *FileLogStore) {
+		last, _ := store.LastIndex()
+		assert.Equal(t, uint64(10), last)
+		var log Log
+		for i := uint64(6); i <= 10; i++ {
+			require.NoError(t, store.GetLog(i, &log))
+			assert.Equal(t, uint64(2), log.Term, "entry %d must be the re-appended term", i)
+			assert.Equal(t, []byte("v2"), log.Data, "entry %d must be the re-appended data", i)
+		}
+		// The untouched prefix stays at term 1.
+		require.NoError(t, store.GetLog(5, &log))
+		assert.Equal(t, uint64(1), log.Term)
+	}
+
+	assertV2(store1)
+	require.NoError(t, store1.Close())
+
+	store2, err := NewFileLogStore(dir, cfg)
+	require.NoError(t, err)
+	defer store2.Close()
+	assertV2(store2)
+}
+
+// An interior delete leaves a hole (tombstone). Recovery must treat the
+// tombstone as written (not a crash boundary) so entries after the hole
+// survive a reopen.
+func TestFileLogStore_InteriorDeleteHoleSurvivesReopen(t *testing.T) {
+	dir, cfg := testConfig(t)
+
+	store1, err := NewFileLogStore(dir, cfg)
+	require.NoError(t, err)
+	require.NoError(t, store1.StoreLogs(testLogs(1, 10)))
+	require.NoError(t, store1.DeleteRange(4, 6))
+	require.NoError(t, store1.Close())
+
+	store2, err := NewFileLogStore(dir, cfg)
+	require.NoError(t, err)
+	defer store2.Close()
+
+	first, _ := store2.FirstIndex()
+	last, _ := store2.LastIndex()
+	assert.Equal(t, uint64(1), first)
+	assert.Equal(t, uint64(10), last, "entries past the hole must survive")
+
+	var log Log
+	for i := uint64(4); i <= 6; i++ {
+		assert.ErrorIs(t, store2.GetLog(i, &log), ErrLogNotFound, "hole at %d", i)
+	}
+	for _, i := range []uint64{1, 2, 3, 7, 8, 9, 10} {
+		require.NoError(t, store2.GetLog(i, &log), "survivor %d", i)
+	}
 }
