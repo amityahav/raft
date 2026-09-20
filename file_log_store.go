@@ -253,6 +253,26 @@ func (s *segment) isFull() bool {
 	return s.entryCount >= s.maxEntries
 }
 
+// entryEnd returns the offset just past the end of rec's frame in the data
+// region.
+func entryEnd(rec identifierRecord) int64 {
+	return rec.DataOffset + int64(entryLenSize) + int64(rec.DataLen) + int64(entryCRCSize)
+}
+
+// deriveDataWritePos computes the data region write position from the
+// identifiers in the index by taking the maximum end offset. This is
+// correct because entries grow the data region sequentially and repairs
+// overwrite in place, so index order matches offset order.
+func (s *segment) deriveDataWritePos() int64 {
+	pos := s.dataOffset
+	for _, rec := range s.index {
+		if end := entryEnd(rec); end > pos {
+			pos = end
+		}
+	}
+	return pos
+}
+
 // containsIndex returns true if index falls within this segment's range.
 func (s *segment) containsIndex(idx uint64) bool {
 	if s.entryCount == 0 {
@@ -471,8 +491,6 @@ func (s *FileLogStore) createSegment(baseIndex uint64) (*segment, error) {
 	// hdr[24:28] = entryCount (0, already zero)
 	dataOff := s.config.dataRegionOffset()
 	binary.BigEndian.PutUint64(hdr[28:36], uint64(dataOff))
-	binary.BigEndian.PutUint64(hdr[36:44], uint64(dataOff)) // dataWritePos starts at dataOff
-	// hdr[44:64] reserved (zeros)
 
 	if _, err := f.WriteAt(hdr[:], 0); err != nil {
 		f.Close()
@@ -532,7 +550,6 @@ func openSegment(path string, maxEntries uint32) (*segment, error) {
 	storedMaxEntries := binary.BigEndian.Uint32(hdr[20:24])
 	entryCount := binary.BigEndian.Uint32(hdr[24:28])
 	dataOff := int64(binary.BigEndian.Uint64(hdr[28:36]))
-	dataWritePos := int64(binary.BigEndian.Uint64(hdr[36:44]))
 
 	if storedMaxEntries != maxEntries {
 		f.Close()
@@ -540,14 +557,13 @@ func openSegment(path string, maxEntries uint32) (*segment, error) {
 	}
 
 	seg := &segment{
-		file:         f,
-		path:         path,
-		baseIndex:    baseIndex,
-		entryCount:   entryCount,
-		maxEntries:   maxEntries,
-		dataOffset:   dataOff,
-		dataWritePos: dataWritePos,
-		index:        make(map[uint64]identifierRecord),
+		file:       f,
+		path:       path,
+		baseIndex:  baseIndex,
+		entryCount: entryCount,
+		maxEntries: maxEntries,
+		dataOffset: dataOff,
+		index:      make(map[uint64]identifierRecord),
 	}
 
 	// Scan identifier slots to rebuild in-memory index.
@@ -567,21 +583,18 @@ func openSegment(path string, maxEntries uint32) (*segment, error) {
 		seg.index[rec.Index] = rec
 	}
 
+	seg.dataWritePos = seg.deriveDataWritePos()
+
 	return seg, nil
 }
 
-// flushSegmentHeader writes the current entryCount and dataWritePos back
-// to the segment file header.
+// flushHeader writes the current entryCount back to the segment file header.
 func (s *segment) flushHeader() error {
-	var buf [16]byte
-	binary.BigEndian.PutUint32(buf[0:4], s.entryCount)
-	binary.BigEndian.PutUint64(buf[4:12], uint64(s.dataWritePos))
-	// entryCount is at offset 24 in the header, dataWritePos at 36.
-	if _, err := s.file.WriteAt(buf[0:4], 24); err != nil {
+	var buf [4]byte
+	binary.BigEndian.PutUint32(buf[:], s.entryCount)
+	// entryCount lives at offset 24 in the header.
+	if _, err := s.file.WriteAt(buf[:], 24); err != nil {
 		return fmt.Errorf("write entryCount: %w", err)
-	}
-	if _, err := s.file.WriteAt(buf[4:12], 36); err != nil {
-		return fmt.Errorf("write dataWritePos: %w", err)
 	}
 	return nil
 }
@@ -896,6 +909,8 @@ func (s *FileLogStore) DeleteRange(min, max uint64) error {
 			delete(s.faultySet, idx)
 		}
 
+		seg.dataWritePos = seg.deriveDataWritePos()
+
 		if !s.config.NoSync {
 			if err := seg.file.Sync(); err != nil {
 				return fmt.Errorf("sync segment after delete: %w", err)
@@ -1076,15 +1091,6 @@ func (s *FileLogStore) DisentangleCrashCorruption() (lastSafeIndex uint64, fault
 	if crashBoundary >= 0 {
 		// Truncate: reduce entry count to discard crash-induced entries.
 		seg.entryCount = uint32(crashBoundary)
-		// Reset dataWritePos to after the last valid entry.
-		if seg.entryCount > 0 {
-			lastIdx := seg.baseIndex + uint64(seg.entryCount) - 1
-			if rec, ok := seg.index[lastIdx]; ok {
-				seg.dataWritePos = rec.DataOffset + int64(entryLenSize) + int64(rec.DataLen) + int64(entryCRCSize)
-			}
-		} else {
-			seg.dataWritePos = seg.dataOffset
-		}
 
 		// Clear identifier slots for discarded entries.
 		for i := uint32(crashBoundary); i < seg.maxEntries; i++ {
@@ -1095,6 +1101,8 @@ func (s *FileLogStore) DisentangleCrashCorruption() (lastSafeIndex uint64, fault
 			slotOff := seg.slotOffset(i)
 			seg.file.WriteAt(zeroBuf[:], slotOff)
 		}
+
+		seg.dataWritePos = seg.deriveDataWritePos()
 
 		if err := seg.flushHeader(); err != nil {
 			return 0, nil, fmt.Errorf("flush header after disentanglement: %w", err)

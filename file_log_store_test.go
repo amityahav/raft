@@ -662,6 +662,98 @@ func TestFileLogStore_RollbackOnFlushFailure(t *testing.T) {
 	}
 }
 
+// The data write position is derived from the identifiers rather than stored,
+// so garbage in the header bytes it used to occupy must not affect recovery.
+func TestFileLogStore_DataWritePosNotReadFromHeader(t *testing.T) {
+	dir, cfg := testConfig(t)
+
+	store1, err := NewFileLogStore(dir, cfg)
+	require.NoError(t, err)
+	require.NoError(t, store1.StoreLogs(testLogs(1, 10)))
+
+	seg := store1.active
+	expected := seg.dataWritePos
+	segPath := seg.path
+
+	// Scribble over the header bytes that previously held dataWritePos.
+	var garbage [8]byte
+	binary.BigEndian.PutUint64(garbage[:], 0xDEADBEEF)
+	_, err = seg.file.WriteAt(garbage[:], 36)
+	require.NoError(t, err)
+	require.NoError(t, store1.Close())
+
+	store2, err := NewFileLogStore(dir, cfg)
+	require.NoError(t, err)
+	defer store2.Close()
+
+	require.Len(t, store2.segments, 1)
+	assert.Equal(t, segPath, store2.segments[0].path)
+	assert.Equal(t, expected, store2.segments[0].dataWritePos,
+		"write position must be derived from identifiers, not the header")
+
+	// Appending after recovery must not clobber the last existing entry.
+	require.NoError(t, store2.StoreLogs(testLogs(11, 12)))
+	for i := uint64(1); i <= 12; i++ {
+		var log Log
+		require.NoError(t, store2.GetLog(i, &log), "entry %d", i)
+		assert.Equal(t, i, log.Index)
+	}
+}
+
+// Deleting a suffix frees the data those entries occupied, so the write
+// position moves back and the next append reuses the space.
+func TestFileLogStore_DeleteRange_SuffixReclaimsSpace(t *testing.T) {
+	store := testStore(t)
+
+	require.NoError(t, store.StoreLogs(testLogs(1, 10)))
+
+	seg := store.active
+	posBefore := seg.dataWritePos
+	endOfSeven := entryEnd(seg.index[7])
+	require.Greater(t, posBefore, endOfSeven)
+
+	require.NoError(t, store.DeleteRange(8, 10))
+
+	assert.Equal(t, endOfSeven, seg.dataWritePos,
+		"write position should fall back to the end of entry 7")
+
+	// The next append reuses the reclaimed region.
+	require.NoError(t, store.StoreLogs(testLogs(8, 8)))
+	assert.Equal(t, endOfSeven, seg.index[8].DataOffset)
+
+	var log Log
+	require.NoError(t, store.GetLog(8, &log))
+	assert.Equal(t, uint64(8), log.Index)
+
+	// Entries before the deleted range are untouched.
+	for i := uint64(1); i <= 7; i++ {
+		require.NoError(t, store.GetLog(i, &log), "entry %d", i)
+		assert.Equal(t, i, log.Index)
+	}
+}
+
+// An interior delete must not reclaim the hole, because later entries sit
+// beyond it in the data region.
+func TestFileLogStore_DeleteRange_InteriorKeepsWritePos(t *testing.T) {
+	store := testStore(t)
+
+	require.NoError(t, store.StoreLogs(testLogs(1, 10)))
+
+	seg := store.active
+	posBefore := seg.dataWritePos
+
+	require.NoError(t, store.DeleteRange(3, 5))
+
+	assert.Equal(t, posBefore, seg.dataWritePos,
+		"an interior hole must not move the write position")
+
+	var log Log
+	for _, i := range []uint64{1, 2, 6, 7, 8, 9, 10} {
+		require.NoError(t, store.GetLog(i, &log), "entry %d", i)
+		assert.Equal(t, i, log.Index)
+	}
+}
+
 func TestFileLogStore_MonotonicLogStore(t *testing.T) {
 	store := testStore(t)
 	assert.True(t, store.IsMonotonic())
