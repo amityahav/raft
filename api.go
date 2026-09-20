@@ -222,6 +222,12 @@ type Raft struct {
 	// prevote feature is disabled if set to true.
 	preVoteDisabled bool
 
+	// ctrlEnabled is true only when the log store, snapshot store, and
+	// transport all implement the CTRL optional interfaces. All CTRL
+	// protocol paths (log recovery, later snapshot-chunk recovery) gate on
+	// this flag; the interfaces themselves are asserted at the call site.
+	ctrlEnabled bool
+
 	// noLegacyTelemetry allows to skip the legacy metrics to avoid duplicates.
 	// legacy metrics are those that have `_peer_name` as metric suffix instead as labels.
 	// e.g: raft_replication_heartbeat_peer0
@@ -514,6 +520,11 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 	// Ensure we have a LogOutput.
 	logger := conf.getOrCreateLogger()
 
+	_, ctrlLogsOK := logs.(CorruptionAwareLogStore)
+	_, ctrlSnapsOK := snaps.(ChunkedSnapshotStore)
+	_, ctrlTransOK := trans.(WithRecovery)
+	ctrlEnabled := ctrlLogsOK && ctrlSnapsOK && ctrlTransOK
+
 	// Try to restore the current term.
 	currentTerm, err := stable.GetUint64(keyCurrentTerm)
 	if err != nil && err.Error() != "not found" {
@@ -526,18 +537,23 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 		return nil, fmt.Errorf("failed to find last log: %v", err)
 	}
 
-	// Get the last log entry. A corruption-aware store may have a faulty last
-	// entry: still recover Term/Index from the identifier so we can boot and
-	// run distributed recovery after election.
+	// Get the last log entry. With CTRL enabled, a faulty last entry still
+	// recovers Term/Index from the identifier so we can boot and run
+	// distributed recovery after election. Without CTRL, preserve the
+	// historical GetLog error path.
 	var lastLog Log
 	if lastIndex > 0 {
-		status, logErr := readLogEntry(logs, lastIndex, &lastLog)
-		if logErr != nil {
-			return nil, fmt.Errorf("failed to get last log at index %d: %v", lastIndex, logErr)
-		}
-		if status != StatusOK {
-			logger.Warn("last log entry is faulty; booting with identifier term/index",
-				"index", lastIndex, "term", lastLog.Term, "status", status)
+		if ctrlEnabled {
+			status, logErr := readLogEntry(logs, lastIndex, &lastLog)
+			if logErr != nil {
+				return nil, fmt.Errorf("failed to get last log at index %d: %v", lastIndex, logErr)
+			}
+			if status != StatusOK {
+				logger.Warn("last log entry is faulty; booting with identifier term/index",
+					"index", lastIndex, "term", lastLog.Term, "status", status)
+			}
+		} else if err = logs.GetLog(lastIndex, &lastLog); err != nil {
+			return nil, fmt.Errorf("failed to get last log at index %d: %v", lastIndex, err)
 		}
 	}
 
@@ -559,6 +575,7 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 	}
 
 	_, transportSupportPreVote := trans.(WithPreVote)
+
 	// Create Raft struct.
 	r := &Raft{
 		protocolVersion:       protocolVersion,
@@ -589,8 +606,15 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 		followerNotifyCh:      make(chan struct{}, 1),
 		mainThreadSaturation:  newSaturationMetric([]string{"raft", "thread", "main", "saturation"}, 1*time.Second),
 		preVoteDisabled:       conf.PreVoteDisabled || !transportSupportPreVote,
+		ctrlEnabled:           ctrlEnabled,
 		noLegacyTelemetry:     conf.NoLegacyTelemetry,
 		RestoreCommittedLogs:  conf.RestoreCommittedLogs,
+	}
+	if ctrlEnabled {
+		r.logger.Info("CTRL enabled")
+	} else if ctrlLogsOK || ctrlSnapsOK || ctrlTransOK {
+		r.logger.Warn("CTRL disabled: need CorruptionAwareLogStore, ChunkedSnapshotStore, and WithRecovery together",
+			"logStore", ctrlLogsOK, "snapshotStore", ctrlSnapsOK, "transport", ctrlTransOK)
 	}
 	if !transportSupportPreVote && !conf.PreVoteDisabled {
 		r.logger.Warn("pre-vote is disabled because it is not supported by the Transport")
@@ -619,14 +643,19 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 	lastappliedIndex := r.getLastApplied()
 	for index := max(snapshotIndex, lastappliedIndex) + 1; index <= lastLog.Index; index++ {
 		var entry Log
-		status, err := readLogEntry(r.logs, index, &entry)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get log at index %d: %w", index, err)
-		}
-		if status != StatusOK {
-			r.logger.Warn("skipping faulty log during configuration replay",
-				"index", index, "status", status)
-			continue
+		if ctrlEnabled {
+			status, err := readLogEntry(r.logs, index, &entry)
+			if err != nil {
+				return nil, fmt.Errorf("failed to get log at index %d: %w", index, err)
+			}
+			if status != StatusOK {
+				r.logger.Warn("skipping faulty log during configuration replay",
+					"index", index, "status", status)
+				continue
+			}
+		} else if err := r.logs.GetLog(index, &entry); err != nil {
+			r.logger.Error("failed to get log", "index", index, "error", err)
+			panic(err)
 		}
 		if err := r.processConfigurationLogEntry(&entry); err != nil {
 			return nil, err

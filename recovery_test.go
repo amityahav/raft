@@ -343,7 +343,7 @@ func TestNewRaft_CorruptedLogDoesNotPanic(t *testing.T) {
 
 	logs := newTestFileLogStore(t, dir, conf)
 	stable := NewInmemStore()
-	snaps := NewInmemSnapshotStore()
+	snaps := newTestChunkedSnaps(t, dir, conf)
 	addr, trans := NewInmemTransport("")
 
 	cfg := Configuration{Servers: []Server{{
@@ -365,7 +365,7 @@ func TestRecoverFaultyLogs_RepairFromMajorityHave(t *testing.T) {
 	orig := &Log{Index: 2, Term: 1, Type: LogCommand, Data: []byte("hello")}
 	r, logs := startRecoverLeader(t, orig, RecoveryHave, orig)
 
-	require.NoError(t, r.recoverFaultyLogs(logs))
+	require.NoError(t, r.recoverFaultyLogs())
 
 	var got Log
 	require.NoError(t, logs.GetLog(2, &got))
@@ -379,7 +379,7 @@ func TestRecoverFaultyLogs_DiscardUncommitted(t *testing.T) {
 	orig := &Log{Index: 2, Term: 1, Type: LogCommand, Data: []byte("uncommitted")}
 	r, logs := startRecoverLeader(t, orig, RecoveryDontHave, nil)
 
-	require.NoError(t, r.recoverFaultyLogs(logs))
+	require.NoError(t, r.recoverFaultyLogs())
 
 	var got Log
 	assert.ErrorIs(t, logs.GetLog(2, &got), ErrLogNotFound)
@@ -390,9 +390,9 @@ func TestRecoverFaultyLogs_DiscardUncommitted(t *testing.T) {
 
 func TestRecoverFaultyLogs_AmbiguousStepsDownError(t *testing.T) {
 	orig := &Log{Index: 2, Term: 1, Type: LogCommand, Data: []byte("maybe")}
-	r, logs := startRecoverLeaderSplit(t, orig)
+	r, _ := startRecoverLeaderSplit(t, orig)
 
-	err := r.recoverFaultyLogs(logs)
+	err := r.recoverFaultyLogs()
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrRecoveryAmbiguous)
 }
@@ -405,7 +405,7 @@ func TestRecoverFaultyLogs_TruncateDoesNotRepairLater(t *testing.T) {
 
 	logs := newTestFileLogStore(t, dir, conf)
 	stable := NewInmemStore()
-	snaps := NewInmemSnapshotStore()
+	snaps := newTestChunkedSnaps(t, dir, conf)
 
 	addr0, t0 := NewInmemTransport("")
 	addr1, t1 := NewInmemTransport("")
@@ -429,12 +429,20 @@ func TestRecoverFaultyLogs_TruncateDoesNotRepairLater(t *testing.T) {
 
 	r, err := NewRaft(conf, &MockFSM{}, logs, stable, snaps, t0)
 	require.NoError(t, err)
+	require.True(t, r.ctrlEnabled)
 	t.Cleanup(func() { _ = r.Shutdown().Error() })
 
-	require.NoError(t, r.recoverFaultyLogs(logs))
+	require.NoError(t, r.recoverFaultyLogs())
 	last, err := logs.LastIndex()
 	require.NoError(t, err)
 	assert.Equal(t, uint64(1), last, "both faulty entries must be dropped by one suffix truncate")
+}
+
+func newTestChunkedSnaps(t *testing.T, dir string, conf *Config) *ChunkedFileSnapshotStore {
+	t.Helper()
+	snaps, err := NewChunkedFileSnapshotStoreWithLogger(filepath.Join(dir, "snaps"), 3, conf.Logger)
+	require.NoError(t, err)
+	return snaps
 }
 
 func newTestFileLogStore(t *testing.T, dir string, conf *Config) *FileLogStore {
@@ -512,7 +520,7 @@ func startRecoverLeader(t *testing.T, orig *Log, peerResult RecoveryResponse, pe
 
 	logs := newTestFileLogStore(t, dir, conf)
 	stable := NewInmemStore()
-	snaps := NewInmemSnapshotStore()
+	snaps := newTestChunkedSnaps(t, dir, conf)
 
 	addr0, t0 := NewInmemTransport("")
 	addr1, t1 := NewInmemTransport("")
@@ -533,6 +541,7 @@ func startRecoverLeader(t *testing.T, orig *Log, peerResult RecoveryResponse, pe
 
 	r, err := NewRaft(conf, &MockFSM{}, logs, stable, snaps, t0)
 	require.NoError(t, err)
+	require.True(t, r.ctrlEnabled)
 	t.Cleanup(func() { _ = r.Shutdown().Error() })
 	return r, logs
 }
@@ -546,7 +555,7 @@ func startRecoverLeaderSplit(t *testing.T, orig *Log) (*Raft, *FileLogStore) {
 
 	logs := newTestFileLogStore(t, dir, conf)
 	stable := NewInmemStore()
-	snaps := NewInmemSnapshotStore()
+	snaps := newTestChunkedSnaps(t, dir, conf)
 
 	addr0, t0 := NewInmemTransport("")
 	addr1, t1 := NewInmemTransport("")
@@ -567,6 +576,7 @@ func startRecoverLeaderSplit(t *testing.T, orig *Log) (*Raft, *FileLogStore) {
 
 	r, err := NewRaft(conf, &MockFSM{}, logs, stable, snaps, t0)
 	require.NoError(t, err)
+	require.True(t, r.ctrlEnabled)
 	t.Cleanup(func() { _ = r.Shutdown().Error() })
 	return r, logs
 }

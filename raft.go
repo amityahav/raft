@@ -470,14 +470,11 @@ func (r *Raft) runLeader() {
 	r.logger.Info("entering leader state", "leader", r)
 
 	// Recover locally-faulty log entries before advertising leadership or
-	// sending a noop. Optional: only stores that implement
-	// CorruptionAwareLogStore participate.
-	if store, ok := r.logs.(CorruptionAwareLogStore); ok {
-		if err := r.recoverFaultyLogs(store); err != nil {
-			r.logger.Error("log recovery failed, stepping down", "error", err)
-			r.setState(Follower)
-			return
-		}
+	// sending a noop. recoverFaultyLogs is a no-op unless CTRL is enabled.
+	if err := r.recoverFaultyLogs(); err != nil {
+		r.logger.Error("log recovery failed, stepping down", "error", err)
+		r.setState(Follower)
+		return
 	}
 
 	metrics.IncrCounter([]string{"raft", "state", "leader"}, 1)

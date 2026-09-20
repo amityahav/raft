@@ -117,45 +117,37 @@ func readLogEntry(logs LogStore, index uint64, log *Log) (IntegrityStatus, error
 	return StatusOK, nil
 }
 
-// recoverFaultyLogs is the leader-side CTRL driver. The caller must already
-// have detected a CorruptionAwareLogStore. It must run on the main thread,
-// after winning an election and before advertising leadership.
-func (r *Raft) recoverFaultyLogs(store CorruptionAwareLogStore) error {
-	faulty, err := store.GetFaultyEntries()
-	if err != nil {
-		return fmt.Errorf("list faulty entries: %w", err)
-	}
-	if len(faulty) == 0 {
+// recoverFaultyLogs is the leader-side CTRL driver. It is a no-op unless
+// CTRL is enabled. It must run on the main thread, after winning an
+// election and before advertising leadership.
+func (r *Raft) recoverFaultyLogs() error {
+	if !r.ctrlEnabled {
 		return nil
 	}
-
-	if _, ok := r.trans.(WithRecovery); !ok {
-		r.logger.Warn("faulty log entries present but transport does not support RecoverEntry; skipping recovery",
-			"count", len(faulty))
-		return nil
+	store, ok := r.logs.(CorruptionAwareLogStore)
+	if !ok {
+		// sanity
+		return fmt.Errorf("CTRL enabled but log store is not CorruptionAwareLogStore")
 	}
 
 	quorum := r.quorumSize()
-	r.logger.Info("recovering faulty log entries", "count", len(faulty), "quorum", quorum)
-
 	for {
-		faulty, err = store.GetFaultyEntries()
+		select {
+		case <-r.shutdownCh:
+			return ErrRaftShutdown
+		default:
+		}
+
+		faulty, err := store.GetFaultyEntries()
 		if err != nil {
 			return fmt.Errorf("list faulty entries: %w", err)
 		}
 		if len(faulty) == 0 {
 			return nil
 		}
-		idx := faulty[0].Index
+
 		if err := r.recoverOneFaulty(store, faulty[0], quorum); err != nil {
 			return err
-		}
-		remaining, err := store.GetFaultyEntries()
-		if err != nil {
-			return fmt.Errorf("list faulty entries: %w", err)
-		}
-		if len(remaining) > 0 && remaining[0].Index == idx {
-			return fmt.Errorf("log recovery made no progress at index %d", idx)
 		}
 	}
 }
@@ -231,11 +223,6 @@ func (r *Raft) recoverOneFaulty(store CorruptionAwareLogStore, fe FaultyEntry, q
 // queryVoters asks every other voter for RecoverEntry. This node's own
 // HaveFaulty copy is not included in either tally.
 func (r *Raft) queryVoters(index, term uint64, timeout time.Duration) (have, dontHave int, replica *Log) {
-	recTrans, ok := r.trans.(WithRecovery)
-	if !ok {
-		return 0, 0, nil
-	}
-
 	type vote struct {
 		resp RecoverEntryResponse
 		err  error
@@ -258,10 +245,15 @@ func (r *Raft) queryVoters(index, term uint64, timeout time.Duration) (have, don
 		Index:     index,
 		Term:      term,
 	}
+	trans, ok := r.trans.(WithRecovery)
+	if !ok {
+		r.logger.Error("CTRL enabled but transport does not support RecoverEntry")
+		return 0, 0, nil
+	}
 	for _, p := range peers {
 		go func(p Server) {
 			var resp RecoverEntryResponse
-			err := recTrans.RecoverEntry(p.ID, p.Address, args, &resp)
+			err := trans.RecoverEntry(p.ID, p.Address, args, &resp)
 			ch <- vote{resp: resp, err: err}
 		}(p)
 	}
