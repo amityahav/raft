@@ -365,7 +365,7 @@ func TestRecoverFaultyLogs_RepairFromMajorityHave(t *testing.T) {
 	orig := &Log{Index: 2, Term: 1, Type: LogCommand, Data: []byte("hello")}
 	r, logs := startRecoverLeader(t, orig, RecoveryHave, orig)
 
-	require.NoError(t, r.recoverFaultyLogs())
+	require.NoError(t, r.recoverFaultyLogs(logs))
 
 	var got Log
 	require.NoError(t, logs.GetLog(2, &got))
@@ -379,7 +379,7 @@ func TestRecoverFaultyLogs_DiscardUncommitted(t *testing.T) {
 	orig := &Log{Index: 2, Term: 1, Type: LogCommand, Data: []byte("uncommitted")}
 	r, logs := startRecoverLeader(t, orig, RecoveryDontHave, nil)
 
-	require.NoError(t, r.recoverFaultyLogs())
+	require.NoError(t, r.recoverFaultyLogs(logs))
 
 	var got Log
 	assert.ErrorIs(t, logs.GetLog(2, &got), ErrLogNotFound)
@@ -390,9 +390,9 @@ func TestRecoverFaultyLogs_DiscardUncommitted(t *testing.T) {
 
 func TestRecoverFaultyLogs_AmbiguousStepsDownError(t *testing.T) {
 	orig := &Log{Index: 2, Term: 1, Type: LogCommand, Data: []byte("maybe")}
-	r, _ := startRecoverLeaderSplit(t, orig)
+	r, logs := startRecoverLeaderSplit(t, orig)
 
-	err := r.recoverFaultyLogs()
+	err := r.recoverFaultyLogs(logs)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrRecoveryAmbiguous)
 }
@@ -431,7 +431,7 @@ func TestRecoverFaultyLogs_TruncateDoesNotRepairLater(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = r.Shutdown().Error() })
 
-	require.NoError(t, r.recoverFaultyLogs())
+	require.NoError(t, r.recoverFaultyLogs(logs))
 	last, err := logs.LastIndex()
 	require.NoError(t, err)
 	assert.Equal(t, uint64(1), last, "both faulty entries must be dropped by one suffix truncate")

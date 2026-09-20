@@ -117,14 +117,10 @@ func readLogEntry(logs LogStore, index uint64, log *Log) (IntegrityStatus, error
 	return StatusOK, nil
 }
 
-// recoverFaultyLogs is the leader-side CTRL driver. It must run on the main
-// thread, after winning an election and before advertising leadership.
-func (r *Raft) recoverFaultyLogs() error {
-	store, ok := r.logs.(CorruptionAwareLogStore)
-	if !ok {
-		return nil
-	}
-
+// recoverFaultyLogs is the leader-side CTRL driver. The caller must already
+// have detected a CorruptionAwareLogStore. It must run on the main thread,
+// after winning an election and before advertising leadership.
+func (r *Raft) recoverFaultyLogs(store CorruptionAwareLogStore) error {
 	faulty, err := store.GetFaultyEntries()
 	if err != nil {
 		return fmt.Errorf("list faulty entries: %w", err)
