@@ -526,11 +526,18 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 		return nil, fmt.Errorf("failed to find last log: %v", err)
 	}
 
-	// Get the last log entry.
+	// Get the last log entry. A corruption-aware store may have a faulty last
+	// entry: still recover Term/Index from the identifier so we can boot and
+	// run distributed recovery after election.
 	var lastLog Log
 	if lastIndex > 0 {
-		if err = logs.GetLog(lastIndex, &lastLog); err != nil {
-			return nil, fmt.Errorf("failed to get last log at index %d: %v", lastIndex, err)
+		status, logErr := readLogEntry(logs, lastIndex, &lastLog)
+		if logErr != nil {
+			return nil, fmt.Errorf("failed to get last log at index %d: %v", lastIndex, logErr)
+		}
+		if status != StatusOK {
+			logger.Warn("last log entry is faulty; booting with identifier term/index",
+				"index", lastIndex, "term", lastLog.Term, "status", status)
 		}
 	}
 
@@ -612,9 +619,14 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 	lastappliedIndex := r.getLastApplied()
 	for index := max(snapshotIndex, lastappliedIndex) + 1; index <= lastLog.Index; index++ {
 		var entry Log
-		if err := r.logs.GetLog(index, &entry); err != nil {
-			r.logger.Error("failed to get log", "index", index, "error", err)
-			panic(err)
+		status, err := readLogEntry(r.logs, index, &entry)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get log at index %d: %w", index, err)
+		}
+		if status != StatusOK {
+			r.logger.Warn("skipping faulty log during configuration replay",
+				"index", index, "status", status)
+			continue
 		}
 		if err := r.processConfigurationLogEntry(&entry); err != nil {
 			return nil, err
