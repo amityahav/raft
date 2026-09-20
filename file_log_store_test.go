@@ -350,7 +350,8 @@ func TestFileLogStore_GetLog_CorruptedReturnsError(t *testing.T) {
 func TestFileLogStore_RepairEntry(t *testing.T) {
 	store := testStore(t)
 
-	require.NoError(t, store.StoreLogs(testLogs(1, 5)))
+	logs := testLogs(1, 5)
+	require.NoError(t, store.StoreLogs(logs))
 
 	// Corrupt entry 4 and register it as faulty.
 	seg := store.findSegment(4)
@@ -366,8 +367,8 @@ func TestFileLogStore_RepairEntry(t *testing.T) {
 	store.faultySet[4] = FaultyEntry{Index: 4, Term: 1, Status: StatusCorrupted}
 	store.mu.Unlock()
 
-	// Repair with correct data.
-	correctLog := testLogs(4, 4)[0]
+	// Repair with the same entry a peer would return for ⟨term 1, index 4⟩.
+	correctLog := logs[3]
 	require.NoError(t, store.RepairEntry(correctLog))
 
 	// Verify it's no longer faulty.
@@ -773,29 +774,99 @@ func TestFileLogStore_LargeEntries(t *testing.T) {
 	assert.Equal(t, largeData, got.Data)
 }
 
-func TestFileLogStore_RepairEntry_DifferentSize(t *testing.T) {
+// A ⟨term, index⟩ pair uniquely identifies a log entry across the cluster, so
+// a replacement that encodes to a different length cannot be the same entry.
+// Relocating it would break the invariant that index order matches data offset
+// order within a segment, so the repair is rejected instead.
+func TestFileLogStore_RepairEntry_DifferentSizeRejected(t *testing.T) {
 	store := testStore(t)
 
-	require.NoError(t, store.StoreLogs(testLogs(1, 5)))
+	logs := testLogs(1, 5)
+	require.NoError(t, store.StoreLogs(logs))
 
-	// Mark entry 3 as faulty.
 	store.mu.Lock()
 	store.faultySet[3] = FaultyEntry{Index: 3, Term: 1, Status: StatusCorrupted}
 	store.mu.Unlock()
 
-	// Repair with a differently-sized entry.
+	seg := store.findSegment(3)
+	require.NotNil(t, seg)
+	before := seg.index[3]
+	writePosBefore := seg.dataWritePos
+
 	repairLog := &Log{
-		Index: 3,
-		Term:  1,
-		Type:  LogCommand,
-		Data:  []byte("this is a much longer replacement data for the entry"),
+		Index:      3,
+		Term:       1,
+		Type:       LogCommand,
+		Data:       []byte("this is a much longer replacement data for the entry"),
+		AppendedAt: logs[2].AppendedAt,
 	}
-	require.NoError(t, store.RepairEntry(repairLog))
+	err := store.RepairEntry(repairLog)
+	require.ErrorIs(t, err, ErrRepairMismatch)
+
+	// The entry must stay faulty and nothing on disk may have moved.
+	faulty, _ := store.GetFaultyEntries()
+	require.Len(t, faulty, 1)
+	assert.Equal(t, uint64(3), faulty[0].Index)
+
+	assert.Equal(t, before, seg.index[3], "identifier must be unchanged")
+	assert.Equal(t, writePosBefore, seg.dataWritePos, "write position must not advance")
+}
+
+// Repairing with a different term is a protocol violation: recovery queries
+// peers for a specific ⟨term, index⟩, so the replacement's term must match.
+func TestFileLogStore_RepairEntry_TermMismatchRejected(t *testing.T) {
+	store := testStore(t)
+
+	logs := testLogs(1, 5)
+	require.NoError(t, store.StoreLogs(logs))
+
+	store.mu.Lock()
+	store.faultySet[2] = FaultyEntry{Index: 2, Term: 1, Status: StatusCorrupted}
+	store.mu.Unlock()
+
+	repairLog := *logs[1]
+	repairLog.Term = 7
+
+	err := store.RepairEntry(&repairLog)
+	require.ErrorIs(t, err, ErrRepairMismatch)
+
+	faulty, _ := store.GetFaultyEntries()
+	require.Len(t, faulty, 1)
+	assert.Equal(t, uint64(2), faulty[0].Index)
+}
+
+// A repair that is byte-identical to the original overwrites in place, leaving
+// the identifier slot and the segment header untouched.
+func TestFileLogStore_RepairEntry_InPlaceLeavesMetadataUntouched(t *testing.T) {
+	store := testStore(t)
+
+	logs := testLogs(1, 5)
+	require.NoError(t, store.StoreLogs(logs))
+
+	seg := store.findSegment(3)
+	require.NotNil(t, seg)
+	before := seg.index[3]
+	writePosBefore := seg.dataWritePos
+	entryCountBefore := seg.entryCount
+
+	// Corrupt entry 3, then repair it with the original.
+	corruptOff := before.DataOffset + int64(entryLenSize) + 1
+	var b [1]byte
+	seg.file.ReadAt(b[:], corruptOff)
+	b[0] ^= 0xFF
+	seg.file.WriteAt(b[:], corruptOff)
+
+	store.mu.Lock()
+	store.faultySet[3] = FaultyEntry{Index: 3, Term: 1, Status: StatusCorrupted}
+	store.mu.Unlock()
+
+	require.NoError(t, store.RepairEntry(logs[2]))
+
+	assert.Equal(t, before, seg.index[3], "identifier must be unchanged")
+	assert.Equal(t, writePosBefore, seg.dataWritePos, "write position must be unchanged")
+	assert.Equal(t, entryCountBefore, seg.entryCount, "entry count must be unchanged")
 
 	var got Log
 	require.NoError(t, store.GetLog(3, &got))
-	assert.Equal(t, repairLog.Data, got.Data)
-
-	faulty, _ := store.GetFaultyEntries()
-	assert.Empty(t, faulty)
+	assert.Equal(t, logs[2].Data, got.Data)
 }

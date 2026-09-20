@@ -80,6 +80,13 @@ var (
 	// is not in the faulty set.
 	ErrEntryNotFaulty = errors.New("entry is not marked as faulty")
 
+	// ErrRepairMismatch is returned by RepairEntry when the replacement
+	// entry is not byte-identical to the entry it replaces. Because a
+	// ⟨term, index⟩ pair uniquely identifies a log entry across the
+	// cluster, this indicates the caller supplied the wrong entry or that
+	// entry encoding is not deterministic.
+	ErrRepairMismatch = errors.New("replacement entry does not match the original")
+
 	// ErrCorruptedEntry is returned by GetLog when an entry fails its
 	// CRC check. Callers that need the integrity status instead of an
 	// error should use GetLogWithIntegrity.
@@ -836,6 +843,7 @@ func (s *FileLogStore) flushAndSync() error {
 // DeleteRange deletes all log entries in the range [min, max] inclusive.
 // Complete segments within the range are removed. Partial overlaps are
 // handled by clearing identifier slots.
+// TODO(amit): ensure disk failures recovery
 func (s *FileLogStore) DeleteRange(min, max uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -967,55 +975,38 @@ func (s *FileLogStore) RepairEntry(log *Log) error {
 		return ErrLogNotFound
 	}
 
-	// Encode the correct entry.
+	// A log entry is uniquely identified by its ⟨term, index⟩ pair, so the
+	// replacement fetched from a peer must be byte-identical to what was
+	// originally written. A mismatch means the caller supplied a different
+	// entry, so reject it rather than relocating: an entry that moves within
+	// a segment breaks the invariant that index order matches data offset
+	// order, which recovery relies on to rebuild the write position.
+	if log.Term != rec.Term {
+		return fmt.Errorf("%w: entry %d term is %d, replacement has term %d",
+			ErrRepairMismatch, log.Index, rec.Term, log.Term)
+	}
+
 	encoded, err := encodeLogEntry(log)
 	if err != nil {
 		return fmt.Errorf("encode repair entry: %w", err)
 	}
 
-	newLen := uint32(len(encoded))
-	needed := int64(entryLenSize + len(encoded) + entryCRCSize)
-
-	var writePos int64
-	if newLen == rec.DataLen {
-		// Same size — overwrite in-place.
-		writePos = rec.DataOffset
-	} else {
-		// Different size — append to end of data region.
-		if seg.dataWritePos+needed > s.config.SegmentSize {
-			return fmt.Errorf("repair entry %d: no space in segment for differently-sized entry", log.Index)
-		}
-		writePos = seg.dataWritePos
-		seg.dataWritePos += needed
+	if uint32(len(encoded)) != rec.DataLen {
+		return fmt.Errorf("%w: entry %d is %d bytes, replacement encodes to %d bytes",
+			ErrRepairMismatch, log.Index, rec.DataLen, len(encoded))
 	}
 
-	// Write the entry frame.
-	frame := make([]byte, needed)
-	binary.BigEndian.PutUint32(frame[0:4], newLen)
-	copy(frame[4:4+newLen], encoded)
-	crc := crc32.ChecksumIEEE(frame[0 : 4+int(newLen)])
-	binary.BigEndian.PutUint32(frame[4+newLen:], crc)
+	// Overwrite the entry frame in place. The identifier is unchanged, so
+	// neither the identifier slot nor the segment header needs rewriting.
+	payloadEnd := entryLenSize + int(rec.DataLen)
+	frame := make([]byte, payloadEnd+entryCRCSize)
+	binary.BigEndian.PutUint32(frame[0:entryLenSize], rec.DataLen)
+	copy(frame[entryLenSize:payloadEnd], encoded)
+	crc := crc32.ChecksumIEEE(frame[0:payloadEnd])
+	binary.BigEndian.PutUint32(frame[payloadEnd:], crc)
 
-	if _, err := seg.file.WriteAt(frame, writePos); err != nil {
+	if _, err := seg.file.WriteAt(frame, rec.DataOffset); err != nil {
 		return fmt.Errorf("write repair entry %d: %w", log.Index, err)
-	}
-
-	// Update identifier if the offset/length changed.
-	if writePos != rec.DataOffset || newLen != rec.DataLen {
-		rec.DataOffset = writePos
-		rec.DataLen = newLen
-		rec.Term = log.Term
-		idBuf := encodeIdentifier(rec)
-		slotNum := uint32(log.Index - seg.baseIndex)
-		if _, err := seg.file.WriteAt(idBuf[:], seg.slotOffset(slotNum)); err != nil {
-			return fmt.Errorf("write repair identifier %d: %w", log.Index, err)
-		}
-		seg.index[log.Index] = rec
-	}
-
-	// Flush header if dataWritePos changed.
-	if err := seg.flushHeader(); err != nil {
-		return fmt.Errorf("flush header after repair: %w", err)
 	}
 
 	if !s.config.NoSync {
