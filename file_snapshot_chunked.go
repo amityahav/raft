@@ -127,12 +127,13 @@ func (c *chunkHasher) finish() []uint32 {
 // --------------------------------------------------------------------------
 
 // ChunkedFileSnapshotStore wraps FileSnapshotStore, adding chunk-level
-// integrity verification and repair. It is a drop-in SnapshotStore: existing
-// behavior is unchanged, and it additionally satisfies ChunkedSnapshotStore.
+// integrity verification and repair. It additionally satisfies
+// ChunkedSnapshotStore.
 //
-// Each finalized snapshot gains a chunks.meta sidecar holding a CRC32 per
-// chunk of state.bin. Snapshots created by a plain FileSnapshotStore have no
-// sidecar; it is generated lazily on first chunk access.
+// Each snapshot it creates gains a chunks.meta sidecar holding a CRC32 per
+// chunk of state.bin. It is intended to be used from the start on a fresh
+// Raft instance: every snapshot goes through its sink, so a missing sidecar
+// is treated as an error rather than being regenerated.
 type ChunkedFileSnapshotStore struct {
 	*FileSnapshotStore
 	chunkSize int
@@ -191,56 +192,18 @@ func (c *ChunkedFileSnapshotStore) chunkDir(id string) string {
 	return filepath.Join(c.path, id)
 }
 
-// loadChunkMeta reads and validates the chunks.meta sidecar for id. If the
-// sidecar is missing (a legacy snapshot), it is generated from state.bin.
+// loadChunkMeta reads and validates the chunks.meta sidecar for id. A missing
+// or corrupted sidecar is an error: every snapshot created by this store
+// writes one, so its absence indicates a snapshot not produced here (or a
+// damaged store).
 func (c *ChunkedFileSnapshotStore) loadChunkMeta(id string) (*chunkMeta, error) {
 	metaPath := filepath.Join(c.chunkDir(id), chunkMetaFilePath)
 	m, err := readChunkMeta(metaPath)
-	if err == nil {
-		if m.MetaCRC != m.computeMetaCRC() {
-			return nil, fmt.Errorf("chunks.meta for snapshot %s is corrupted", id)
-		}
-		return m, nil
-	}
-	if !os.IsNotExist(err) {
-		return nil, err
-	}
-	return c.generateChunkMeta(id)
-}
-
-// generateChunkMeta builds a chunkMeta for a snapshot lacking a sidecar by
-// scanning state.bin, and persists it best-effort.
-func (c *ChunkedFileSnapshotStore) generateChunkMeta(id string) (*chunkMeta, error) {
-	statePath := filepath.Join(c.chunkDir(id), stateFilePath)
-	fh, err := os.Open(statePath)
 	if err != nil {
-		return nil, fmt.Errorf("open state for chunk meta: %w", err)
+		return nil, fmt.Errorf("read chunks.meta for snapshot %s: %w", id, err)
 	}
-	defer func() { _ = fh.Close() }()
-
-	hasher := newChunkHasher(c.chunkSize)
-	buf := make([]byte, 64*1024)
-	for {
-		n, rerr := fh.Read(buf)
-		if n > 0 {
-			hasher.Write(buf[:n])
-		}
-		if rerr == io.EOF {
-			break
-		}
-		if rerr != nil {
-			return nil, fmt.Errorf("read state for chunk meta: %w", rerr)
-		}
-	}
-
-	crcs := hasher.finish()
-	m := &chunkMeta{ChunkSize: c.chunkSize, Count: len(crcs), CRCs: crcs}
-	m.MetaCRC = m.computeMetaCRC()
-
-	// Persist best-effort so future reads skip regeneration.
-	metaPath := filepath.Join(c.chunkDir(id), chunkMetaFilePath)
-	if werr := writeChunkMeta(metaPath, m, c.noSync); werr != nil {
-		c.logger.Warn("failed to persist generated chunk meta", "id", id, "error", werr)
+	if m.MetaCRC != m.computeMetaCRC() {
+		return nil, fmt.Errorf("chunks.meta for snapshot %s is corrupted", id)
 	}
 	return m, nil
 }

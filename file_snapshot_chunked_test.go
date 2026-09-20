@@ -284,44 +284,37 @@ func TestChunkedSnapshot_DataCorruptionDoesNotTouchSidecar(t *testing.T) {
 	assert.Equal(t, StatusCorrupted, status)
 }
 
-// A snapshot created by a plain FileSnapshotStore has no chunks.meta sidecar.
-// The chunked store must generate it lazily on first access and persist it.
-func TestChunkedSnapshot_LegacyLazyMetaGeneration(t *testing.T) {
+// A snapshot lacking a chunks.meta sidecar (e.g., not produced by this store)
+// is rejected rather than regenerated. The store assumes it is used from the
+// start on a fresh Raft instance.
+func TestChunkedSnapshot_MissingSidecarRejected(t *testing.T) {
 	dir := t.TempDir()
 
-	// Write a snapshot using the plain store.
+	// Write a snapshot using the plain store — no sidecar is written.
 	plain, err := NewFileSnapshotStoreWithLogger(dir, 3, newTestLogger(t))
 	require.NoError(t, err)
 	_, trans := NewInmemTransport(NewInmemAddr())
 	sink, err := plain.Create(SnapshotVersionMax, 10, 3, Configuration{}, 0, trans)
 	require.NoError(t, err)
-	data := makeData(40)
-	_, err = sink.Write(data)
+	_, err = sink.Write(makeData(40))
 	require.NoError(t, err)
 	require.NoError(t, sink.Close())
 	id := sink.ID()
 
-	// No sidecar exists yet.
 	chunked, err := NewChunkedFileSnapshotStoreWithLogger(dir, 3, newTestLogger(t))
 	require.NoError(t, err)
 	chunked.chunkSize = 16
+
 	metaPath := filepath.Join(chunked.chunkDir(id), chunkMetaFilePath)
 	_, statErr := os.Stat(metaPath)
-	require.True(t, os.IsNotExist(statErr), "sidecar should not exist yet")
+	require.True(t, os.IsNotExist(statErr), "sidecar should not exist")
 
-	// First access generates and persists it.
-	count, err := chunked.ChunkCount(id)
-	require.NoError(t, err)
-	assert.Equal(t, 3, count)
+	_, err = chunked.ChunkCount(id)
+	require.Error(t, err, "missing sidecar must be an error")
 
+	// It must not be lazily generated as a side effect.
 	_, statErr = os.Stat(metaPath)
-	require.NoError(t, statErr, "sidecar should now be persisted")
-
-	for i := 0; i < count; i++ {
-		status, err := chunked.GetChunkIntegrity(id, i)
-		require.NoError(t, err)
-		assert.Equal(t, StatusOK, status)
-	}
+	assert.True(t, os.IsNotExist(statErr), "sidecar must not be generated")
 }
 
 func TestChunkedSnapshot_MultipleSnapshotsFaultyScan(t *testing.T) {
