@@ -504,8 +504,7 @@ func (r *Raft) runLeader() {
 	defer func() {
 		close(stopCh)
 
-		// Stop the runtime recovery worker and unblock any replication
-		// goroutines waiting on an in-flight repair before we tear down
+		// Stop the runtime recovery poller before tearing down
 		// replication state below.
 		r.stopRecovery()
 
@@ -836,12 +835,16 @@ func (r *Raft) leaderLoop() {
 				lastIdxInGroup = idx
 			}
 
-			// Process the group
+			// Process the group. A CTRL apply hole stops before the
+			// faulty index; leave those inflight entries queued so a
+			// later commitCh (after the poller repairs) can retry.
 			if len(groupReady) != 0 {
-				r.processLogs(lastIdxInGroup, groupFutures)
+				appliedThrough := r.processLogs(lastIdxInGroup, groupFutures)
 
 				for _, e := range groupReady {
-					r.leaderState.inflight.Remove(e)
+					if e.Value.(*logFuture).log.Index <= appliedThrough {
+						r.leaderState.inflight.Remove(e)
+					}
 				}
 			}
 
@@ -1311,12 +1314,15 @@ func (r *Raft) dispatchLogs(applyLogs []*logFuture) {
 // pass futures=nil.
 // Leaders call this when entries are committed. They pass the futures from any
 // inflight logs.
-func (r *Raft) processLogs(index uint64, futures map[uint64]*logFuture) {
+// It returns the highest index that was applied (or skipped as a no-op). With
+// CTRL enabled, a store read failure stops at the hole instead of panicking
+// and returns the index before it.
+func (r *Raft) processLogs(index uint64, futures map[uint64]*logFuture) uint64 {
 	// Reject logs we've applied already
 	lastApplied := r.getLastApplied()
 	if index <= lastApplied {
 		r.logger.Warn("skipping application of old log", "index", index)
-		return
+		return lastApplied
 	}
 
 	applyBatch := func(batch []*commitTuple) {
@@ -1348,6 +1354,17 @@ func (r *Raft) processLogs(index uint64, futures map[uint64]*logFuture) {
 			l := new(Log)
 			if err := r.logs.GetLog(idx, l); err != nil {
 				r.logger.Error("failed to get log", "index", idx, "error", err)
+				if r.ctrlEnabled {
+					// Stop at the hole. The leader poller repairs
+					// GetFaultyEntries and nudges commitCh; do not
+					// apply or respond inflight at/after this index.
+					if len(batch) != 0 {
+						applyBatch(batch)
+					}
+					appliedThrough := idx - 1
+					r.setLastApplied(appliedThrough)
+					return appliedThrough
+				}
 				panic(err)
 			}
 			preparedLog = r.prepareLog(l, nil)
@@ -1378,6 +1395,7 @@ func (r *Raft) processLogs(index uint64, futures map[uint64]*logFuture) {
 
 	// Update the lastApplied index and term
 	r.setLastApplied(index)
+	return index
 }
 
 // processLog is invoked to process the application of a single committed log entry.
