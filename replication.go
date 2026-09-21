@@ -97,8 +97,11 @@ type followerReplication struct {
 	// repairLock protects pendingFaulty, discardFrom, and repairKick.
 	repairLock sync.Mutex
 	// pendingFaulty is the follower's last reported hole set (⟨term, index⟩).
+	// Replaced wholesale on every AE reply; indexes are not removed one-by-one.
 	pendingFaulty []FaultyEntry
-	// discardFrom is the lowest index the leader does not know (no log copy).
+	// discardFrom is the lowest index the leader has no log copy for (follower
+	// is ahead). Holes before this can still be same-term repairs; at/after
+	// this the next AE sends DiscardFrom and the suffix is truncated.
 	discardFrom uint64
 	// repairKick is set when the next AppendEntries should carry repairs or
 	// DiscardFrom even if nextIndex is already past lastIndex.
@@ -286,7 +289,8 @@ CHECK_MORE:
 	default:
 	}
 
-	// Check if there are more logs to replicate
+	// More Entries, or a repair/discard heartbeat while nextIndex is already
+	// past lastIndex (takeRepairKick consumes the flag so we send one RPC).
 	if atomic.LoadUint64(&s.nextIndex) <= lastIndex || s.takeRepairKick() {
 		goto START
 	}
@@ -573,6 +577,8 @@ func (r *Raft) pipelineDecode(s *followerReplication, p AppendPipeline, stopCh, 
 			// Update our replication state
 			updateLastAppended(s, req)
 			r.handleFollowerFaults(s, resp)
+			// Consume remaining pipeline responses, then drop back to
+			// replicateTo so the next RPC can carry RepairEntries / DiscardFrom.
 			if s.takeRepairKick() {
 				return
 			}
@@ -693,6 +699,8 @@ func (r *Raft) handleFollowerFaults(s *followerReplication, resp *AppendEntriesR
 		return
 	}
 
+	// Snapshot this reply's list. After the follower repairs or DeleteRange,
+	// GetFaultyEntries shrinks and the next reply overwrites pendingFaulty.
 	s.repairLock.Lock()
 	s.pendingFaulty = append([]FaultyEntry(nil), resp.FaultyEntries...)
 	s.discardFrom = 0
@@ -708,13 +716,14 @@ func (r *Raft) handleFollowerFaults(s *followerReplication, resp *AppendEntriesR
 		var log Log
 		err := r.readReplicationLog(fe.Index, &log)
 		if err == nil && log.Term == fe.Term {
-			kick = true
+			kick = true // next AE: RepairEntries
 			continue
 		}
 		if errors.Is(err, ErrCorruptedEntry) {
-			continue
+			continue // leader's own copy is bad; recovery poller must fix it first
 		}
 		if err == nil && log.Term != fe.Term {
+			// Same index, different term: vanilla conflict via Entries, not RepairEntries.
 			if atomic.LoadUint64(&s.nextIndex) > fe.Index {
 				atomic.StoreUint64(&s.nextIndex, fe.Index)
 			}
@@ -722,6 +731,7 @@ func (r *Raft) handleFollowerFaults(s *followerReplication, resp *AppendEntriesR
 			continue
 		}
 		if errors.Is(err, ErrLogNotFound) {
+			// Follower is ahead of the leader; keep the lowest unknown index.
 			if discardFrom == 0 || fe.Index < discardFrom {
 				discardFrom = fe.Index
 			}
@@ -740,6 +750,8 @@ func (r *Raft) handleFollowerFaults(s *followerReplication, resp *AppendEntriesR
 	}
 }
 
+// takeRepairKick reports whether the next AppendEntries should go out even
+// if nextIndex is already past lastIndex, then clears the flag.
 func (s *followerReplication) takeRepairKick() bool {
 	s.repairLock.Lock()
 	defer s.repairLock.Unlock()
@@ -768,6 +780,9 @@ func (r *Raft) fillFollowerRecovery(s *followerReplication, req *AppendEntriesRe
 		max = 64
 	}
 	for _, fe := range pending {
+		// Suffix we are about to DiscardFrom: leader has no copy (read would
+		// be ErrLogNotFound). Skip rather than fetch. Holes before discardFrom
+		// can still be same-term RepairEntries.
 		if discardFrom > 0 && fe.Index >= discardFrom {
 			continue
 		}

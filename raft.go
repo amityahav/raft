@@ -1531,6 +1531,11 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 		r.setLeader(r.trans.DecodePeer(a.Leader), ServerID(a.ID))
 	}
 
+	// Repairs/discard before prev-log so one RPC can heal the prev slot and
+	// then append. DiscardFrom is "leader has no copy of that index".
+	// applyRepairEntries may also discard if a repair payload's term does not
+	// match the local identifier (stale/out-of-order RPC), which is not the
+	// same as a.DiscardFrom.
 	if r.ctrlEnabled {
 		r.applyRepairEntries(a.RepairEntries)
 		r.applyDiscardFrom(a.DiscardFrom)
@@ -1541,6 +1546,8 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 		lastIdx, lastTerm := r.getLastEntry()
 
 		var prevLogTerm uint64
+		// CTRL always reads the store: in-memory lastTerm can hide a corrupt
+		// last/prev slot. Reject still piggybacks FaultyEntries via the defer.
 		if r.ctrlEnabled {
 			var prevLog Log
 			status, err := readLogEntry(r.logs, a.PrevLogEntry, &prevLog)
@@ -1598,19 +1605,18 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 						"error", err)
 					return
 				}
-				if status != StatusOK {
-					if entry.Term == storeEntry.Term {
-						if store, ok := r.logs.(CorruptionAwareLogStore); ok {
-							if err := store.RepairEntry(entry); err != nil {
-								r.logger.Error("failed to repair log entry from AppendEntries",
-									"index", entry.Index, "error", err)
-								return
-							}
-						}
-						continue
+				// Same ⟨term, index⟩ but CRC bad: overwrite in place and
+				// treat the slot as already matching.
+				if status != StatusOK && entry.Term == storeEntry.Term {
+					store, ok := r.logs.(CorruptionAwareLogStore)
+					if !ok {
+						return
 					}
-					// Different term at a faulty slot: fall through to suffix truncate.
-				} else if entry.Term == storeEntry.Term {
+					if err := store.RepairEntry(entry); err != nil {
+						r.logger.Error("failed to repair log entry from AppendEntries",
+							"index", entry.Index, "error", err)
+						return
+					}
 					continue
 				}
 			} else if err := r.logs.GetLog(entry.Index, &storeEntry); err != nil {
@@ -1619,18 +1625,21 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 					"error", err)
 				return
 			}
-			if entry.Term != storeEntry.Term {
-				r.logger.Warn("clearing log suffix", "from", entry.Index, "to", lastLogIdx)
-				if err := r.logs.DeleteRange(entry.Index, lastLogIdx); err != nil {
-					r.logger.Error("failed to clear log suffix", "error", err)
-					return
-				}
-				if entry.Index <= r.configurations.latestIndex {
-					r.setLatestConfiguration(r.configurations.committed, r.configurations.committedIndex)
-				}
-				newEntries = a.Entries[i:]
-				break
+			if entry.Term == storeEntry.Term {
+				continue // same ⟨term, index⟩ already on disk (or just repaired)
 			}
+			// Different term at this index: truncate the follower suffix and
+			// take the rest of Entries as the new tail ("conflict via Entries").
+			r.logger.Warn("clearing log suffix", "from", entry.Index, "to", lastLogIdx)
+			if err := r.logs.DeleteRange(entry.Index, lastLogIdx); err != nil {
+				r.logger.Error("failed to clear log suffix", "error", err)
+				return
+			}
+			if entry.Index <= r.configurations.latestIndex {
+				r.setLatestConfiguration(r.configurations.committed, r.configurations.committedIndex)
+			}
+			newEntries = a.Entries[i:]
+			break
 		}
 
 		if n := len(newEntries); n > 0 {
@@ -1677,6 +1686,7 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 		r.processLogs(idx, nil)
 		metrics.MeasureSince([]string{"raft", "rpc", "appendEntries", "processLogs"}, start)
 	} else if r.ctrlEnabled && (len(a.RepairEntries) > 0 || a.DiscardFrom > 0) {
+		// Commit index may already be past the hole; lastApplied is stuck.
 		if idx := r.getCommitIndex(); idx > r.getLastApplied() {
 			r.processLogs(idx, nil)
 		}
@@ -1732,6 +1742,8 @@ func (r *Raft) applyRepairEntries(entries []*Log) {
 			continue
 		}
 		if existing.Term != e.Term {
+			// fillFollowerRecovery only sends same-term copies; this is a
+			// delayed repair arriving after the slot was already replaced.
 			r.logger.Warn("repair term mismatch; discarding uncommitted suffix",
 				"index", e.Index, "local-term", existing.Term, "repair-term", e.Term)
 			r.applyDiscardFrom(e.Index)
@@ -1748,7 +1760,8 @@ func (r *Raft) applyRepairEntries(entries []*Log) {
 
 // applyDiscardFrom truncates the uncommitted suffix starting at index, the
 // same shape as the AppendEntries conflict path. Refuses at or below the
-// commit index.
+// commit index. Called for a.DiscardFrom (leader has no copy) and from
+// applyRepairEntries when a repair term does not match the local identifier.
 func (r *Raft) applyDiscardFrom(index uint64) {
 	if index == 0 {
 		return
