@@ -27,10 +27,14 @@ const (
 	recoverAmbiguous
 )
 
-// recoverDecision applies the CTRL quorum rule among voters.
+// recoverDecision applies the CTRL log-recovery rule (FAST'18 §3.4.3).
 // HaveFaulty (including this node's own copy) counts for neither side.
+//
+//	≥1 Have            → repair (one intact copy is enough)
+//	majority DontHave  → discard (entry was never committed)
+//	otherwise          → ambiguous (wait / all remaining copies faulty)
 func recoverDecision(have, dontHave, quorum int) recoverOutcome {
-	if have >= quorum {
+	if have >= 1 {
 		return recoverRepair
 	}
 	if dontHave >= quorum {

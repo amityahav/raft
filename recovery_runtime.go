@@ -30,18 +30,19 @@ type recoveryManager struct {
 	inflight map[uint64][]*recoverFuture
 	closed   bool
 
-	workCh   chan FaultyEntry
-	stopCh   chan struct{}
-	commitCh chan struct{}
-	stepDown chan struct{}
+	workCh    chan FaultyEntry
+	stopCh    chan struct{}
+	commitCh  chan struct{}
+	discardCh chan uint64
 
 	peers  []Server
 	quorum int
 }
 
 // startRecovery installs a recovery manager and spawns its worker. Must be
-// called on the main thread from runLeader after setupLeaderState and after the
-// voter set is known. It is a no-op unless CTRL is enabled.
+// called on the main thread from runLeader after setupLeaderState, and before
+// startStopReplication, so replicators never observe a nil manager or a stale
+// membership snapshot. It is a no-op unless CTRL is enabled.
 func (r *Raft) startRecovery() {
 	if !r.ctrlEnabled {
 		return
@@ -50,13 +51,30 @@ func (r *Raft) startRecovery() {
 		inflight: make(map[uint64][]*recoverFuture),
 		workCh:   make(chan FaultyEntry, 64),
 		stopCh:   make(chan struct{}),
-		commitCh: r.leaderState.commitCh,
-		stepDown: r.leaderState.stepDown,
-		peers:    r.voterPeers(),
-		quorum:   r.quorumSize(),
+		commitCh:  r.leaderState.commitCh,
+		discardCh: make(chan uint64),
 	}
 	r.recovery.Store(m)
+	r.syncRecoveryMembership()
 	r.goFunc(func() { r.runRecovery(m) })
+}
+
+// syncRecoveryMembership copies the current voter set and quorum onto the
+// recovery manager. Must run on the main thread: r.configurations is not
+// safe to read from the worker. Call this after the latest configuration is
+// stored and before startStopReplication so new replicators recover against
+// the matching membership.
+func (r *Raft) syncRecoveryMembership() {
+	m := r.recovery.Load()
+	if m == nil {
+		return
+	}
+	peers := r.voterPeers()
+	quorum := r.quorumSize()
+	m.mu.Lock()
+	m.peers = peers
+	m.quorum = quorum
+	m.mu.Unlock()
 }
 
 // stopRecovery tears down the recovery manager and fails any inflight futures so
@@ -159,13 +177,15 @@ func (r *Raft) runRecovery(m *recoveryManager) {
 }
 
 // recoverIndex recovers a single faulty ⟨term, index⟩: re-check the store
-// (another index's recovery may already have fixed it), otherwise query voters.
-// A majority Have repairs in place. Discard and ambiguous outcomes step the
-// leader down rather than truncating from this goroutine (DeleteRange and
-// configuration rollback belong on the main thread).
+// (another index's recovery may already have fixed it), otherwise query voters
+// and apply FAST'18 §3.4.3: ≥1 Have repairs in place; majority DontHave
+// truncates this uncommitted suffix; otherwise log and leave a TODO (all
+// remaining copies faulty / not enough votes).
 func (r *Raft) recoverIndex(m *recoveryManager, store CorruptionAwareLogStore, index, term uint64) {
 	m.mu.Lock()
 	_, ok := m.inflight[index]
+	peers := append([]Server(nil), m.peers...)
+	quorum := m.quorum
 	m.mu.Unlock()
 	if !ok {
 		return // already completed or torn down
@@ -185,35 +205,118 @@ func (r *Raft) recoverIndex(m *recoveryManager, store CorruptionAwareLogStore, i
 		return
 	}
 
-	have, dontHave, replica := r.queryVoters(m.peers, index, term, r.config().ElectionTimeout)
-	switch recoverDecision(have, dontHave, m.quorum) {
+	have, dontHave, replica := r.queryVoters(peers, index, term, r.config().ElectionTimeout)
+	switch recoverDecision(have, dontHave, quorum) {
 	case recoverRepair:
 		if replica == nil {
-			r.stepDownFromRecovery(m, index, fmt.Errorf("majority have entry %d but no copy returned", index))
+			r.completeRecovery(m, index, nil, fmt.Errorf("have response for entry %d but no copy returned", index))
 			return
 		}
 		if err := store.RepairEntry(replica); err != nil {
-			r.stepDownFromRecovery(m, index, fmt.Errorf("repair entry %d: %w", index, err))
+			r.completeRecovery(m, index, nil, fmt.Errorf("repair entry %d: %w", index, err))
 			return
 		}
-		r.logger.Info("recovery: repaired faulty log entry at runtime", "index", index, "term", term)
+		r.logger.Info("recovery: repaired faulty log entry", "index", index, "term", term)
 		cp := *replica
 		r.completeRecovery(m, index, &cp, nil)
-		// Nudge the leader to re-apply anything that was blocked behind this
-		// hole now that it is fixed.
 		asyncNotifyCh(m.commitCh)
 
+	case recoverDiscard:
+		// Truncation and config rollback belong on the main thread
+		// (same as AppendEntries suffix conflict). Waiters are completed
+		// there after the suffix is gone.
+		select {
+		case m.discardCh <- index:
+		case <-m.stopCh:
+			r.completeRecovery(m, index, nil, ErrLeadershipLost)
+		}
+
 	default:
-		// discard or ambiguous: do not truncate from the recovery worker.
-		r.stepDownFromRecovery(m, index, ErrRecoveryAmbiguous)
+		// TODO(ctrl): if every remaining copy is HaveFaulty (or we timed out
+		// without a Have or a majority DontHave), the paper stays unavailable
+		// until a healthy replica appears. For now just log and fail waiters
+		// so replication does not block forever.
+		r.logger.Error("recovery: no intact copy and no majority DontHave; leaving entry unrepaired",
+			"index", index, "term", term, "have", have, "dontHave", dontHave, "quorum", quorum)
+		r.completeRecovery(m, index, nil, ErrRecoveryAmbiguous)
 	}
 }
 
-func (r *Raft) stepDownFromRecovery(m *recoveryManager, index uint64, cause error) {
-	r.logger.Warn("recovery: stepping down to recover faulty log entry",
-		"index", index, "error", cause)
-	asyncNotifyCh(m.stepDown)
-	r.completeRecovery(m, index, nil, cause)
+// recoveryDiscardCh is the leaderLoop receive side for uncommitted-suffix
+// truncation. A nil channel is ignored by select when CTRL is off.
+func (r *Raft) recoveryDiscardCh() <-chan uint64 {
+	m := r.recovery.Load()
+	if m == nil {
+		return nil
+	}
+	return m.discardCh
+}
+
+// handleRecoverDiscard truncates the uncommitted suffix starting at index.
+// Must run on the main thread. Mirrors the AppendEntries conflict path:
+// DeleteRange through lastLog, roll latest config back to committed if it
+// lived in the suffix, then setLastLog. Also fails inflight Apply futures
+// and recovery waiters for that index.
+func (r *Raft) handleRecoverDiscard(index uint64) {
+	m := r.recovery.Load()
+	if m == nil {
+		return
+	}
+
+	if index <= r.getCommitIndex() {
+		err := fmt.Errorf("majority dont-have for index %d which is at or below commit index %d",
+			index, r.getCommitIndex())
+		r.completeRecovery(m, index, nil, err)
+		return
+	}
+
+	lastIdx := r.getLastIndex()
+	if err := r.logs.DeleteRange(index, lastIdx); err != nil {
+		r.completeRecovery(m, index, nil, fmt.Errorf("truncate uncommitted suffix from %d: %w", index, err))
+		return
+	}
+	if r.configurations.latestIndex >= index {
+		r.setLatestConfiguration(r.configurations.committed, r.configurations.committedIndex)
+	}
+	newLast, err := r.logs.LastIndex()
+	if err != nil {
+		r.completeRecovery(m, index, nil, err)
+		return
+	}
+	if newLast > 0 {
+		var lastLog Log
+		status, err := readLogEntry(r.logs, newLast, &lastLog)
+		if err != nil {
+			r.completeRecovery(m, index, nil, fmt.Errorf("read new last log %d after truncate: %w", newLast, err))
+			return
+		}
+		if status != StatusOK {
+			r.completeRecovery(m, index, nil, fmt.Errorf("new last log %d is faulty after truncate", newLast))
+			return
+		}
+		r.setLastLog(lastLog.Index, lastLog.Term)
+	} else {
+		r.setLastLog(0, 0)
+	}
+
+	if r.leaderState.inflight != nil {
+		for e := r.leaderState.inflight.Front(); e != nil; {
+			next := e.Next()
+			fut := e.Value.(*logFuture)
+			if fut.log.Index >= index {
+				fut.respond(ErrLogNotFound)
+				r.leaderState.inflight.Remove(e)
+			}
+			e = next
+		}
+	}
+	for _, f := range r.leaderState.replState {
+		asyncNotifyCh(f.triggerCh)
+	}
+
+	r.logger.Info("recovery: discarded uncommitted faulty suffix",
+		"from", index, "to", lastIdx, "newLast", newLast)
+	r.completeRecovery(m, index, nil, ErrLogNotFound)
 }
 
 // readReplicationLog reads a log entry for replication. When CTRL is enabled and

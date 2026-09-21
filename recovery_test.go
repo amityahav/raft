@@ -308,16 +308,18 @@ func startCTRLRaft(t *testing.T) (*Raft, *InmemTransport, ServerAddress) {
 }
 
 func TestRecoverDecision(t *testing.T) {
-	// 3 voters → quorum 2
+	// 3 voters → quorum 2. One Have is enough to repair (paper §3.4.3 Case 1).
+	assert.Equal(t, recoverRepair, recoverDecision(1, 0, 2))
+	assert.Equal(t, recoverRepair, recoverDecision(1, 1, 2))
 	assert.Equal(t, recoverRepair, recoverDecision(2, 0, 2))
-	assert.Equal(t, recoverRepair, recoverDecision(3, 0, 2))
 	assert.Equal(t, recoverDiscard, recoverDecision(0, 2, 2))
-	assert.Equal(t, recoverAmbiguous, recoverDecision(1, 1, 2))
 	assert.Equal(t, recoverAmbiguous, recoverDecision(0, 0, 2))
-	assert.Equal(t, recoverAmbiguous, recoverDecision(1, 0, 2))
-	// 5 voters → quorum 3
-	assert.Equal(t, recoverRepair, recoverDecision(3, 1, 3))
-	assert.Equal(t, recoverAmbiguous, recoverDecision(2, 2, 3))
+	assert.Equal(t, recoverAmbiguous, recoverDecision(0, 1, 2))
+	// 5 voters → quorum 3. Have still wins even when DontHave is also a majority
+	// (paper: first of Case 1 / Case 2; keeping a correct copy is always safe).
+	assert.Equal(t, recoverRepair, recoverDecision(1, 3, 3))
+	assert.Equal(t, recoverDiscard, recoverDecision(0, 3, 3))
+	assert.Equal(t, recoverAmbiguous, recoverDecision(0, 2, 3))
 }
 
 func TestFileLogStore_GetLogWithIntegrityRecordsFaulty(t *testing.T) {

@@ -152,22 +152,50 @@ func TestRuntimeRecovery_CoalescesConcurrentRequests(t *testing.T) {
 	assert.Equal(t, int32(1), atomic.LoadInt32(&n2count), "peer n2 must be queried once despite two waiters")
 }
 
-// TestRuntimeRecovery_StepsDownOnUncommitted verifies that an uncommitted
-// faulty entry (majority DontHave) makes the runtime worker step the leader
-// down instead of truncating on a background goroutine.
-func TestRuntimeRecovery_StepsDownOnUncommitted(t *testing.T) {
+// TestRuntimeRecovery_DiscardUncommitted verifies that majority DontHave
+// truncates the uncommitted faulty suffix (paper §3.4.3 Case 2).
+func TestRuntimeRecovery_DiscardUncommitted(t *testing.T) {
 	orig := &Log{Index: 2, Term: 1, Type: LogCommand, Data: []byte("uncommitted")}
-	r, _ := startRuntimeRecovery(t, orig, RecoveryDontHave, nil)
+	r, logs := startRuntimeRecovery(t, orig, RecoveryDontHave, nil)
+
+	f := r.requestRecovery(2, 1)
+	require.NotNil(t, f)
+
+	m := r.recovery.Load()
+	require.NotNil(t, m)
+	select {
+	case idx := <-m.discardCh:
+		assert.Equal(t, uint64(2), idx)
+		r.handleRecoverDiscard(idx)
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected discard to be dispatched to the main thread")
+	}
+
+	assert.ErrorIs(t, f.Error(), ErrLogNotFound)
+
+	var got Log
+	assert.ErrorIs(t, logs.GetLog(2, &got), ErrLogNotFound)
+	last, err := logs.LastIndex()
+	require.NoError(t, err)
+	assert.Equal(t, uint64(1), last)
+}
+
+// TestRuntimeRecovery_AllCopiesFaulty is the paper's "remain unavailable"
+// case: every queried voter returns HaveFaulty. We log and fail the future
+// rather than truncating a possibly committed entry.
+func TestRuntimeRecovery_AllCopiesFaulty(t *testing.T) {
+	orig := &Log{Index: 2, Term: 1, Type: LogCommand, Data: []byte("all-faulty")}
+	r, logs := startRuntimeRecovery(t, orig, RecoveryHaveFaulty, nil)
 
 	f := r.requestRecovery(2, 1)
 	require.NotNil(t, f)
 	assert.ErrorIs(t, f.Error(), ErrRecoveryAmbiguous)
 
-	select {
-	case <-r.leaderState.stepDown:
-	case <-time.After(time.Second):
-		t.Fatal("expected step-down signal")
-	}
+	// Entry is still present (and still faulty); we must not have discarded it.
+	var got Log
+	status, err := logs.GetLogWithIntegrity(2, &got)
+	require.NoError(t, err)
+	assert.Equal(t, StatusCorrupted, status)
 }
 
 // TestRuntimeRecovery_ReadFallsBackWhenNoManager ensures readReplicationLog
@@ -181,4 +209,25 @@ func TestRuntimeRecovery_ReadFallsBackWhenNoManager(t *testing.T) {
 	var out Log
 	err := r.readReplicationLog(2, &out)
 	assert.ErrorIs(t, err, ErrCorruptedEntry)
+}
+
+func TestRuntimeRecovery_MembershipTracksConfig(t *testing.T) {
+	orig := &Log{Index: 2, Term: 1, Type: LogCommand, Data: []byte("cfg")}
+	r, _ := startRuntimeRecovery(t, orig, RecoveryHave, orig)
+
+	m := r.recovery.Load()
+	require.NotNil(t, m)
+	m.mu.Lock()
+	assert.Len(t, m.peers, 2)
+	assert.Equal(t, 2, m.quorum)
+	m.mu.Unlock()
+
+	r.configurations.latest.Servers = append(r.configurations.latest.Servers,
+		Server{Suffrage: Voter, ID: "n3", Address: "n3"})
+	r.syncRecoveryMembership()
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	assert.Len(t, m.peers, 3, "new voter must be queried on the next recovery round")
+	assert.Equal(t, 3, m.quorum, "4 voters → quorum 3")
 }

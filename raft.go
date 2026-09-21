@@ -566,13 +566,13 @@ func (r *Raft) runLeader() {
 		}
 	}()
 
+	// Spawn the runtime recovery worker before replication so a replicator
+	// that immediately hits a faulty log sees a live manager and a current
+	// voter/quorum snapshot. No-op unless CTRL is enabled.
+	r.startRecovery()
+
 	// Start a replication routine for each peer
 	r.startStopReplication()
-
-	// Spawn the runtime recovery worker. From here on, a corrupted log entry
-	// discovered while replicating or applying is repaired on demand without
-	// blocking heartbeats. No-op unless CTRL is enabled.
-	r.startRecovery()
 
 	// Dispatch a no-op log entry first. This gets this leader up to the latest
 	// possible commit index, even in the absence of client commands. This used
@@ -699,6 +699,10 @@ func (r *Raft) leaderLoop() {
 		case <-r.leaderState.stepDown:
 			r.mainThreadSaturation.working()
 			r.setState(Follower)
+
+		case index := <-r.recoveryDiscardCh():
+			r.mainThreadSaturation.working()
+			r.handleRecoverDiscard(index)
 
 		case future := <-r.leadershipTransferCh:
 			r.mainThreadSaturation.working()
@@ -1248,6 +1252,9 @@ func (r *Raft) appendConfigurationEntry(future *configurationChangeFuture) {
 	index := future.Index()
 	r.setLatestConfiguration(configuration, index)
 	r.leaderState.commitment.setConfiguration(configuration)
+	// Publish the new voter set before starting replicators for added peers,
+	// so an on-demand RecoverEntry round does not use the previous quorum.
+	r.syncRecoveryMembership()
 	r.startStopReplication()
 }
 
