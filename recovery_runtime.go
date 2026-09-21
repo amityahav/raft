@@ -160,8 +160,9 @@ func (r *Raft) runRecovery(m *recoveryManager) {
 
 // recoverIndex recovers a single faulty ⟨term, index⟩: re-check the store
 // (another index's recovery may already have fixed it), otherwise query voters.
-// A majority Have repairs in place; anything else steps the leader down so the
-// synchronous become-leader path can drain it safely on the next term.
+// A majority Have repairs in place. Discard and ambiguous outcomes step the
+// leader down rather than truncating from this goroutine (DeleteRange and
+// configuration rollback belong on the main thread).
 func (r *Raft) recoverIndex(m *recoveryManager, store CorruptionAwareLogStore, index, term uint64) {
 	m.mu.Lock()
 	_, ok := m.inflight[index]
@@ -203,10 +204,7 @@ func (r *Raft) recoverIndex(m *recoveryManager, store CorruptionAwareLogStore, i
 		asyncNotifyCh(m.commitCh)
 
 	default:
-		// discard or ambiguous: stepping down is the safe choice at runtime.
-		// The uncommitted-suffix truncation and configuration rollback are
-		// handled by the synchronous become-leader driver on the next term,
-		// where r.configurations is only touched on the main thread.
+		// discard or ambiguous: do not truncate from the recovery worker.
 		r.stepDownFromRecovery(m, index, ErrRecoveryAmbiguous)
 	}
 }

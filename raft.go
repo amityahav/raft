@@ -469,14 +469,6 @@ func (r *Raft) setupLeaderState() {
 func (r *Raft) runLeader() {
 	r.logger.Info("entering leader state", "leader", r)
 
-	// Recover locally-faulty log entries before advertising leadership or
-	// sending a noop. recoverFaultyLogs is a no-op unless CTRL is enabled.
-	if err := r.recoverFaultyLogs(); err != nil {
-		r.logger.Error("log recovery failed, stepping down", "error", err)
-		r.setState(Follower)
-		return
-	}
-
 	metrics.IncrCounter([]string{"raft", "state", "leader"}, 1)
 
 	// Notify that we are the leader

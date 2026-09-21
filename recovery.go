@@ -11,8 +11,6 @@ import (
 	"github.com/hashicorp/go-metrics"
 )
 
-const recoverMaxAttempts = 3
-
 var (
 	// ErrRecoveryAmbiguous is returned when peer responses do not yield a
 	// majority Have or DontHave, so the leader cannot decide whether a
@@ -115,110 +113,6 @@ func readLogEntry(logs LogStore, index uint64, log *Log) (IntegrityStatus, error
 		return StatusOK, err
 	}
 	return StatusOK, nil
-}
-
-// recoverFaultyLogs is the leader-side CTRL driver. It is a no-op unless
-// CTRL is enabled. It must run on the main thread, after winning an
-// election and before advertising leadership.
-func (r *Raft) recoverFaultyLogs() error {
-	if !r.ctrlEnabled {
-		return nil
-	}
-	store, ok := r.logs.(CorruptionAwareLogStore)
-	if !ok {
-		// sanity
-		return fmt.Errorf("CTRL enabled but log store is not CorruptionAwareLogStore")
-	}
-
-	quorum := r.quorumSize()
-	peers := r.voterPeers()
-	for {
-		select {
-		case <-r.shutdownCh:
-			return ErrRaftShutdown
-		default:
-		}
-
-		faulty, err := store.GetFaultyEntries()
-		if err != nil {
-			return fmt.Errorf("list faulty entries: %w", err)
-		}
-		if len(faulty) == 0 {
-			return nil
-		}
-
-		if err := r.recoverOneFaulty(store, peers, faulty[0], quorum); err != nil {
-			return err
-		}
-	}
-}
-
-func (r *Raft) recoverOneFaulty(store CorruptionAwareLogStore, peers []Server, fe FaultyEntry, quorum int) error {
-	timeout := r.config().ElectionTimeout
-	var outcome recoverOutcome
-	var replica *Log
-	for attempt := 1; attempt <= recoverMaxAttempts; attempt++ {
-		have, dontHave, entry := r.queryVoters(peers, fe.Index, fe.Term, timeout)
-		outcome = recoverDecision(have, dontHave, quorum)
-		replica = entry
-		r.logger.Info("recovery tally",
-			"index", fe.Index, "term", fe.Term,
-			"have", have, "dontHave", dontHave, "quorum", quorum,
-			"outcome", outcome, "attempt", attempt)
-		if outcome != recoverAmbiguous {
-			break
-		}
-		if attempt < recoverMaxAttempts {
-			select {
-			case <-time.After(timeout):
-			case <-r.shutdownCh:
-				return ErrRaftShutdown
-			}
-		}
-	}
-
-	switch outcome {
-	case recoverRepair:
-		if replica == nil {
-			return fmt.Errorf("majority have entry %d but no copy was returned", fe.Index)
-		}
-		if err := store.RepairEntry(replica); err != nil {
-			return fmt.Errorf("repair entry %d: %w", fe.Index, err)
-		}
-		r.logger.Info("repaired faulty log entry from peer", "index", fe.Index, "term", fe.Term)
-		return nil
-
-	case recoverDiscard:
-		if fe.Index <= r.getCommitIndex() {
-			return fmt.Errorf("majority dont-have for index %d which is at or below commit index %d",
-				fe.Index, r.getCommitIndex())
-		}
-		lastIdx := r.getLastIndex()
-		if err := r.logs.DeleteRange(fe.Index, lastIdx); err != nil {
-			return fmt.Errorf("truncate uncommitted suffix from %d: %w", fe.Index, err)
-		}
-		if r.configurations.latestIndex >= fe.Index {
-			r.setLatestConfiguration(r.configurations.committed, r.configurations.committedIndex)
-		}
-		newLast, err := r.logs.LastIndex()
-		if err != nil {
-			return err
-		}
-		var lastLog Log
-		if newLast > 0 {
-			if err := r.logs.GetLog(newLast, &lastLog); err != nil {
-				return fmt.Errorf("read new last log %d after truncate: %w", newLast, err)
-			}
-			r.setLastLog(lastLog.Index, lastLog.Term)
-		} else {
-			r.setLastLog(0, 0)
-		}
-		r.logger.Info("discarded uncommitted faulty suffix", "from", fe.Index, "to", lastIdx, "newLast", newLast)
-		return nil
-
-	default:
-		return fmt.Errorf("%w: index %d term %d", ErrRecoveryAmbiguous, fe.Index, fe.Term)
-	}
 }
 
 // voterPeers returns every voter other than this node from the latest

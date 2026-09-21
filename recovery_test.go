@@ -361,83 +361,6 @@ func TestNewRaft_CorruptedLogDoesNotPanic(t *testing.T) {
 	require.NotNil(t, r)
 }
 
-func TestRecoverFaultyLogs_RepairFromMajorityHave(t *testing.T) {
-	orig := &Log{Index: 2, Term: 1, Type: LogCommand, Data: []byte("hello")}
-	r, logs := startRecoverLeader(t, orig, RecoveryHave, orig)
-
-	require.NoError(t, r.recoverFaultyLogs())
-
-	var got Log
-	require.NoError(t, logs.GetLog(2, &got))
-	assert.Equal(t, orig.Data, got.Data)
-	faulty, err := logs.GetFaultyEntries()
-	require.NoError(t, err)
-	assert.Empty(t, faulty)
-}
-
-func TestRecoverFaultyLogs_DiscardUncommitted(t *testing.T) {
-	orig := &Log{Index: 2, Term: 1, Type: LogCommand, Data: []byte("uncommitted")}
-	r, logs := startRecoverLeader(t, orig, RecoveryDontHave, nil)
-
-	require.NoError(t, r.recoverFaultyLogs())
-
-	var got Log
-	assert.ErrorIs(t, logs.GetLog(2, &got), ErrLogNotFound)
-	last, err := logs.LastIndex()
-	require.NoError(t, err)
-	assert.Equal(t, uint64(1), last)
-}
-
-func TestRecoverFaultyLogs_AmbiguousStepsDownError(t *testing.T) {
-	orig := &Log{Index: 2, Term: 1, Type: LogCommand, Data: []byte("maybe")}
-	r, _ := startRecoverLeaderSplit(t, orig)
-
-	err := r.recoverFaultyLogs()
-	require.Error(t, err)
-	assert.ErrorIs(t, err, ErrRecoveryAmbiguous)
-}
-
-func TestRecoverFaultyLogs_TruncateDoesNotRepairLater(t *testing.T) {
-	dir := t.TempDir()
-	conf := testCTRLConfig(t)
-	conf.skipStartup = true
-	conf.LocalID = "n0"
-
-	logs := newTestFileLogStore(t, dir, conf)
-	stable := NewInmemStore()
-	snaps := newTestChunkedSnaps(t, dir, conf)
-
-	addr0, t0 := NewInmemTransport("")
-	addr1, t1 := NewInmemTransport("")
-	addr2, t2 := NewInmemTransport("")
-	connectInmem(t0, addr0, t1, addr1, t2, addr2)
-
-	cfg := Configuration{Servers: []Server{
-		{Suffrage: Voter, ID: "n0", Address: addr0},
-		{Suffrage: Voter, ID: "n1", Address: addr1},
-		{Suffrage: Voter, ID: "n2", Address: addr2},
-	}}
-	require.NoError(t, BootstrapCluster(conf, logs, stable, snaps, t0, cfg))
-	e2 := &Log{Index: 2, Term: 1, Type: LogCommand, Data: []byte("a")}
-	e3 := &Log{Index: 3, Term: 1, Type: LogCommand, Data: []byte("b")}
-	require.NoError(t, logs.StoreLogs([]*Log{e2, e3}))
-	corruptLogData(t, logs, 2)
-	corruptLogData(t, logs, 3)
-
-	go answerRecover(t, t1, RecoveryDontHave, nil)
-	go answerRecover(t, t2, RecoveryDontHave, nil)
-
-	r, err := NewRaft(conf, &MockFSM{}, logs, stable, snaps, t0)
-	require.NoError(t, err)
-	require.True(t, r.ctrlEnabled)
-	t.Cleanup(func() { _ = r.Shutdown().Error() })
-
-	require.NoError(t, r.recoverFaultyLogs())
-	last, err := logs.LastIndex()
-	require.NoError(t, err)
-	assert.Equal(t, uint64(1), last, "both faulty entries must be dropped by one suffix truncate")
-}
-
 func newTestChunkedSnaps(t *testing.T, dir string, conf *Config) *ChunkedFileSnapshotStore {
 	t.Helper()
 	snaps, err := NewChunkedFileSnapshotStoreWithLogger(filepath.Join(dir, "snaps"), 3, conf.Logger)
@@ -538,41 +461,6 @@ func startRecoverLeader(t *testing.T, orig *Log, peerResult RecoveryResponse, pe
 
 	go answerRecover(t, t1, peerResult, peerEntry)
 	go answerRecover(t, t2, peerResult, peerEntry)
-
-	r, err := NewRaft(conf, &MockFSM{}, logs, stable, snaps, t0)
-	require.NoError(t, err)
-	require.True(t, r.ctrlEnabled)
-	t.Cleanup(func() { _ = r.Shutdown().Error() })
-	return r, logs
-}
-
-func startRecoverLeaderSplit(t *testing.T, orig *Log) (*Raft, *FileLogStore) {
-	t.Helper()
-	dir := t.TempDir()
-	conf := testCTRLConfig(t)
-	conf.skipStartup = true
-	conf.LocalID = "n0"
-
-	logs := newTestFileLogStore(t, dir, conf)
-	stable := NewInmemStore()
-	snaps := newTestChunkedSnaps(t, dir, conf)
-
-	addr0, t0 := NewInmemTransport("")
-	addr1, t1 := NewInmemTransport("")
-	addr2, t2 := NewInmemTransport("")
-	connectInmem(t0, addr0, t1, addr1, t2, addr2)
-
-	cfg := Configuration{Servers: []Server{
-		{Suffrage: Voter, ID: "n0", Address: addr0},
-		{Suffrage: Voter, ID: "n1", Address: addr1},
-		{Suffrage: Voter, ID: "n2", Address: addr2},
-	}}
-	require.NoError(t, BootstrapCluster(conf, logs, stable, snaps, t0, cfg))
-	require.NoError(t, logs.StoreLogs([]*Log{orig}))
-	corruptLogData(t, logs, orig.Index)
-
-	go answerRecover(t, t1, RecoveryHave, orig)
-	go answerRecover(t, t2, RecoveryDontHave, nil)
 
 	r, err := NewRaft(conf, &MockFSM{}, logs, stable, snaps, t0)
 	require.NoError(t, err)
