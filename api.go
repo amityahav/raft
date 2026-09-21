@@ -228,6 +228,12 @@ type Raft struct {
 	// this flag; the interfaces themselves are asserted at the call site.
 	ctrlEnabled bool
 
+	// recovery is the leader-side runtime recovery worker. It is non-nil only
+	// while this node is leader with CTRL enabled. Replication and apply paths
+	// use it to repair a corrupted log entry on demand without blocking
+	// heartbeats. See recovery_runtime.go.
+	recovery atomic.Pointer[recoveryManager]
+
 	// noLegacyTelemetry allows to skip the legacy metrics to avoid duplicates.
 	// legacy metrics are those that have `_peer_name` as metric suffix instead as labels.
 	// e.g: raft_replication_heartbeat_peer0

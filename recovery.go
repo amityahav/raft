@@ -131,6 +131,7 @@ func (r *Raft) recoverFaultyLogs() error {
 	}
 
 	quorum := r.quorumSize()
+	peers := r.voterPeers()
 	for {
 		select {
 		case <-r.shutdownCh:
@@ -146,18 +147,18 @@ func (r *Raft) recoverFaultyLogs() error {
 			return nil
 		}
 
-		if err := r.recoverOneFaulty(store, faulty[0], quorum); err != nil {
+		if err := r.recoverOneFaulty(store, peers, faulty[0], quorum); err != nil {
 			return err
 		}
 	}
 }
 
-func (r *Raft) recoverOneFaulty(store CorruptionAwareLogStore, fe FaultyEntry, quorum int) error {
+func (r *Raft) recoverOneFaulty(store CorruptionAwareLogStore, peers []Server, fe FaultyEntry, quorum int) error {
 	timeout := r.config().ElectionTimeout
 	var outcome recoverOutcome
 	var replica *Log
 	for attempt := 1; attempt <= recoverMaxAttempts; attempt++ {
-		have, dontHave, entry := r.queryVoters(fe.Index, fe.Term, timeout)
+		have, dontHave, entry := r.queryVoters(peers, fe.Index, fe.Term, timeout)
 		outcome = recoverDecision(have, dontHave, quorum)
 		replica = entry
 		r.logger.Info("recovery tally",
@@ -220,14 +221,11 @@ func (r *Raft) recoverOneFaulty(store CorruptionAwareLogStore, fe FaultyEntry, q
 	}
 }
 
-// queryVoters asks every other voter for RecoverEntry. This node's own
-// HaveFaulty copy is not included in either tally.
-func (r *Raft) queryVoters(index, term uint64, timeout time.Duration) (have, dontHave int, replica *Log) {
-	type vote struct {
-		resp RecoverEntryResponse
-		err  error
-	}
-
+// voterPeers returns every voter other than this node from the latest
+// configuration. It reads r.configurations and must be called on the main
+// thread (e.g. in runLeader); the resulting snapshot can then be handed to a
+// background worker.
+func (r *Raft) voterPeers() []Server {
 	var peers []Server
 	for _, s := range r.configurations.latest.Servers {
 		if s.Suffrage != Voter || s.ID == r.localID {
@@ -235,8 +233,20 @@ func (r *Raft) queryVoters(index, term uint64, timeout time.Duration) (have, don
 		}
 		peers = append(peers, s)
 	}
+	return peers
+}
+
+// queryVoters asks each given voter for RecoverEntry. This node's own
+// HaveFaulty copy is not included in either tally. The peers slice is a
+// snapshot so this is safe to call from a background goroutine.
+func (r *Raft) queryVoters(peers []Server, index, term uint64, timeout time.Duration) (have, dontHave int, replica *Log) {
 	if len(peers) == 0 {
 		return 0, 0, nil
+	}
+
+	type vote struct {
+		resp RecoverEntryResponse
+		err  error
 	}
 
 	ch := make(chan vote, len(peers))
