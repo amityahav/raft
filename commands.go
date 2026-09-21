@@ -42,6 +42,18 @@ type AppendEntriesRequest struct {
 
 	// Commit index on the leader
 	LeaderCommitIndex uint64
+
+	// RepairEntries are in-place replacements for follower log slots that
+	// failed integrity checks. They are not mixed into Entries so a
+	// heartbeat that only carries repairs does not bump nextIndex.
+	// Empty when CTRL is disabled.
+	RepairEntries []*Log
+
+	// DiscardFrom, when non-zero, is the first index of an uncommitted
+	// suffix the follower should drop: the leader has no copy of the
+	// ⟨term, index⟩ the follower reported (paper §3.4.3). A different
+	// term at the same index uses the Entries conflict path instead.
+	DiscardFrom uint64
 }
 
 // GetRPCHeader - See WithRPCHeader.
@@ -66,6 +78,12 @@ type AppendEntriesResponse struct {
 	// There are scenarios where this request didn't succeed
 	// but there's no need to wait/back-off the next attempt.
 	NoRetryBackoff bool
+
+	// FaultyEntries lists locally-corrupted log slots (⟨term, index⟩ from
+	// the identifier). Followers fill this on every AppendEntries reply
+	// when CTRL is enabled, including rejects and heartbeats, so the
+	// leader can send RepairEntries or DiscardFrom on a later RPC.
+	FaultyEntries []FaultyEntry
 }
 
 // GetRPCHeader - See WithRPCHeader.

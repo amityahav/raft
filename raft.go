@@ -1505,6 +1505,8 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 	}
 	var rpcErr error
 	defer func() {
+		resp.LastLog = r.getLastIndex()
+		r.attachFaultyEntries(resp)
 		rpc.Respond(resp, rpcErr)
 	}()
 
@@ -1528,12 +1530,30 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 	} else {
 		r.setLeader(r.trans.DecodePeer(a.Leader), ServerID(a.ID))
 	}
+
+	if r.ctrlEnabled {
+		r.applyRepairEntries(a.RepairEntries)
+		r.applyDiscardFrom(a.DiscardFrom)
+	}
+
 	// Verify the last log entry
 	if a.PrevLogEntry > 0 {
 		lastIdx, lastTerm := r.getLastEntry()
 
 		var prevLogTerm uint64
-		if a.PrevLogEntry == lastIdx {
+		if r.ctrlEnabled {
+			var prevLog Log
+			status, err := readLogEntry(r.logs, a.PrevLogEntry, &prevLog)
+			if err != nil || status != StatusOK {
+				r.logger.Warn("failed to get previous log",
+					"previous-index", a.PrevLogEntry,
+					"last-index", lastIdx,
+					"error", err, "status", status)
+				resp.NoRetryBackoff = true
+				return
+			}
+			prevLogTerm = prevLog.Term
+		} else if a.PrevLogEntry == lastIdx {
 			prevLogTerm = lastTerm
 		} else {
 			var prevLog Log
@@ -1570,7 +1590,30 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 				break
 			}
 			var storeEntry Log
-			if err := r.logs.GetLog(entry.Index, &storeEntry); err != nil {
+			if r.ctrlEnabled {
+				status, err := readLogEntry(r.logs, entry.Index, &storeEntry)
+				if err != nil {
+					r.logger.Warn("failed to get log entry",
+						"index", entry.Index,
+						"error", err)
+					return
+				}
+				if status != StatusOK {
+					if entry.Term == storeEntry.Term {
+						if store, ok := r.logs.(CorruptionAwareLogStore); ok {
+							if err := store.RepairEntry(entry); err != nil {
+								r.logger.Error("failed to repair log entry from AppendEntries",
+									"index", entry.Index, "error", err)
+								return
+							}
+						}
+						continue
+					}
+					// Different term at a faulty slot: fall through to suffix truncate.
+				} else if entry.Term == storeEntry.Term {
+					continue
+				}
+			} else if err := r.logs.GetLog(entry.Index, &storeEntry); err != nil {
 				r.logger.Warn("failed to get log entry",
 					"index", entry.Index,
 					"error", err)
@@ -1633,11 +1676,116 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 		}
 		r.processLogs(idx, nil)
 		metrics.MeasureSince([]string{"raft", "rpc", "appendEntries", "processLogs"}, start)
+	} else if r.ctrlEnabled && (len(a.RepairEntries) > 0 || a.DiscardFrom > 0) {
+		if idx := r.getCommitIndex(); idx > r.getLastApplied() {
+			r.processLogs(idx, nil)
+		}
 	}
 
 	// Everything went well, set success
 	resp.Success = true
 	r.setLastContact()
+}
+
+// attachFaultyEntries copies the local faulty set onto an AppendEntries
+// response so the leader can repair or discard on a later RPC. No-op unless
+// CTRL is enabled. Cap the list so a large hole set cannot blow the RPC.
+func (r *Raft) attachFaultyEntries(resp *AppendEntriesResponse) {
+	if !r.ctrlEnabled {
+		return
+	}
+	store, ok := r.logs.(CorruptionAwareLogStore)
+	if !ok {
+		return
+	}
+	faulty, err := store.GetFaultyEntries()
+	if err != nil {
+		r.logger.Error("failed to list faulty entries for AppendEntries", "error", err)
+		return
+	}
+	max := r.config().MaxAppendEntries
+	if max > 0 && len(faulty) > max {
+		faulty = faulty[:max]
+	}
+	resp.FaultyEntries = faulty
+}
+
+// applyRepairEntries overwrites matching ⟨term, index⟩ slots in place.
+// A repair whose term does not match the local identifier is treated as a
+// conflict and truncates the uncommitted suffix (paper §3.4.3).
+func (r *Raft) applyRepairEntries(entries []*Log) {
+	if len(entries) == 0 {
+		return
+	}
+	store, ok := r.logs.(CorruptionAwareLogStore)
+	if !ok {
+		return
+	}
+	for _, e := range entries {
+		if e == nil {
+			continue
+		}
+		var existing Log
+		status, err := store.GetLogWithIntegrity(e.Index, &existing)
+		if err != nil {
+			r.logger.Warn("repair skipped; log not found", "index", e.Index, "error", err)
+			continue
+		}
+		if existing.Term != e.Term {
+			r.logger.Warn("repair term mismatch; discarding uncommitted suffix",
+				"index", e.Index, "local-term", existing.Term, "repair-term", e.Term)
+			r.applyDiscardFrom(e.Index)
+			continue
+		}
+		if status == StatusOK {
+			continue
+		}
+		if err := store.RepairEntry(e); err != nil {
+			r.logger.Error("failed to repair log entry", "index", e.Index, "error", err)
+		}
+	}
+}
+
+// applyDiscardFrom truncates the uncommitted suffix starting at index, the
+// same shape as the AppendEntries conflict path. Refuses at or below the
+// commit index.
+func (r *Raft) applyDiscardFrom(index uint64) {
+	if index == 0 {
+		return
+	}
+	if index <= r.getCommitIndex() {
+		r.logger.Error("refusing to discard at or below commit index",
+			"index", index, "commit", r.getCommitIndex())
+		return
+	}
+	lastLogIdx, _ := r.getLastLog()
+	if index > lastLogIdx {
+		return
+	}
+	r.logger.Warn("clearing log suffix", "from", index, "to", lastLogIdx)
+	if err := r.logs.DeleteRange(index, lastLogIdx); err != nil {
+		r.logger.Error("failed to clear log suffix", "error", err)
+		return
+	}
+	if r.configurations.latestIndex >= index {
+		r.setLatestConfiguration(r.configurations.committed, r.configurations.committedIndex)
+	}
+	newLast, err := r.logs.LastIndex()
+	if err != nil {
+		r.logger.Error("last index after discard", "error", err)
+		return
+	}
+	if newLast > 0 {
+		var lastLog Log
+		status, err := readLogEntry(r.logs, newLast, &lastLog)
+		if err != nil || status != StatusOK {
+			r.logger.Error("read new last log after discard", "index", newLast, "error", err)
+			return
+		}
+		r.setLastLog(lastLog.Index, lastLog.Term)
+	} else {
+		r.setLastLog(0, 0)
+	}
 }
 
 // processConfigurationLogEntry takes a log entry and updates the latest

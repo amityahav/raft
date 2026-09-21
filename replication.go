@@ -93,6 +93,16 @@ type followerReplication struct {
 	// allowPipeline is used to determine when to pipeline the AppendEntries RPCs.
 	// It is private to this replication goroutine.
 	allowPipeline bool
+
+	// repairLock protects pendingFaulty, discardFrom, and repairKick.
+	repairLock sync.Mutex
+	// pendingFaulty is the follower's last reported hole set (⟨term, index⟩).
+	pendingFaulty []FaultyEntry
+	// discardFrom is the lowest index the leader does not know (no log copy).
+	discardFrom uint64
+	// repairKick is set when the next AppendEntries should carry repairs or
+	// DiscardFrom even if nextIndex is already past lastIndex.
+	repairKick bool
 }
 
 // notifyAll is used to notify all the waiting verify futures
@@ -262,6 +272,8 @@ START:
 		r.logger.Warn("appendEntries rejected, sending older logs", "peer", peer, "next", atomic.LoadUint64(&s.nextIndex))
 	}
 
+	r.handleFollowerFaults(s, &resp)
+
 CHECK_MORE:
 	// Poll the stop channel here in case we are looping and have been asked
 	// to stop, or have stepped down as leader. Even for the best effort case
@@ -275,7 +287,7 @@ CHECK_MORE:
 	}
 
 	// Check if there are more logs to replicate
-	if atomic.LoadUint64(&s.nextIndex) <= lastIndex {
+	if atomic.LoadUint64(&s.nextIndex) <= lastIndex || s.takeRepairKick() {
 		goto START
 	}
 	return
@@ -553,13 +565,17 @@ func (r *Raft) pipelineDecode(s *followerReplication, p AppendPipeline, stopCh, 
 			// Update the last contact
 			s.setLastContact()
 
-			// Abort pipeline if not successful
 			if !resp.Success {
+				r.handleFollowerFaults(s, resp)
 				return
 			}
 
 			// Update our replication state
 			updateLastAppended(s, req)
+			r.handleFollowerFaults(s, resp)
+			if s.takeRepairKick() {
+				return
+			}
 		case <-stopCh:
 			return
 		}
@@ -579,6 +595,7 @@ func (r *Raft) setupAppendEntries(s *followerReplication, req *AppendEntriesRequ
 	if err := r.setNewLogs(req, nextIndex, lastIndex); err != nil {
 		return err
 	}
+	r.fillFollowerRecovery(s, req)
 	return nil
 }
 
@@ -662,4 +679,111 @@ func updateLastAppended(s *followerReplication, req *AppendEntriesRequest) {
 
 	// Notify still leader
 	s.notifyAll(true)
+}
+
+// handleFollowerFaults records holes the follower piggybacked on an
+// AppendEntries reply. Same ⟨term, index⟩ as the leader → repair on the next
+// RPC; missing or other term → discard / conflict. Ignores delayed replies
+// whose Term does not match this replicator's term.
+func (r *Raft) handleFollowerFaults(s *followerReplication, resp *AppendEntriesResponse) {
+	if !r.ctrlEnabled || resp == nil {
+		return
+	}
+	if resp.Term != s.currentTerm {
+		return
+	}
+
+	s.repairLock.Lock()
+	s.pendingFaulty = append([]FaultyEntry(nil), resp.FaultyEntries...)
+	s.discardFrom = 0
+	s.repairLock.Unlock()
+
+	if len(resp.FaultyEntries) == 0 {
+		return
+	}
+
+	kick := false
+	var discardFrom uint64
+	for _, fe := range resp.FaultyEntries {
+		var log Log
+		err := r.readReplicationLog(fe.Index, &log)
+		if err == nil && log.Term == fe.Term {
+			kick = true
+			continue
+		}
+		if errors.Is(err, ErrCorruptedEntry) {
+			continue
+		}
+		if err == nil && log.Term != fe.Term {
+			if atomic.LoadUint64(&s.nextIndex) > fe.Index {
+				atomic.StoreUint64(&s.nextIndex, fe.Index)
+			}
+			kick = true
+			continue
+		}
+		if errors.Is(err, ErrLogNotFound) {
+			if discardFrom == 0 || fe.Index < discardFrom {
+				discardFrom = fe.Index
+			}
+			kick = true
+		}
+	}
+
+	s.repairLock.Lock()
+	s.discardFrom = discardFrom
+	if kick {
+		s.repairKick = true
+	}
+	s.repairLock.Unlock()
+	if kick {
+		asyncNotifyCh(s.triggerCh)
+	}
+}
+
+func (s *followerReplication) takeRepairKick() bool {
+	s.repairLock.Lock()
+	defer s.repairLock.Unlock()
+	kick := s.repairKick
+	s.repairKick = false
+	return kick
+}
+
+// fillFollowerRecovery attaches RepairEntries / DiscardFrom for holes this
+// follower reported. Same-term copies are repaired in place; unknown indexes
+// set DiscardFrom. Other-term conflicts are left to Entries via nextIndex.
+func (r *Raft) fillFollowerRecovery(s *followerReplication, req *AppendEntriesRequest) {
+	if !r.ctrlEnabled {
+		return
+	}
+	s.repairLock.Lock()
+	pending := append([]FaultyEntry(nil), s.pendingFaulty...)
+	discardFrom := s.discardFrom
+	s.repairLock.Unlock()
+	if len(pending) == 0 && discardFrom == 0 {
+		return
+	}
+
+	max := r.config().MaxAppendEntries
+	if max <= 0 {
+		max = 64
+	}
+	for _, fe := range pending {
+		if discardFrom > 0 && fe.Index >= discardFrom {
+			continue
+		}
+		var log Log
+		err := r.readReplicationLog(fe.Index, &log)
+		if err != nil {
+			continue
+		}
+		if log.Term != fe.Term {
+			continue
+		}
+		if len(req.RepairEntries) >= max {
+			break
+		}
+		cp := log
+		req.RepairEntries = append(req.RepairEntries, &cp)
+	}
+	req.DiscardFrom = discardFrom
 }
