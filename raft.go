@@ -1348,31 +1348,6 @@ func (r *Raft) processLogs(index uint64, futures map[uint64]*logFuture) {
 		} else {
 			l := new(Log)
 			if err := r.logs.GetLog(idx, l); err != nil {
-				if r.ctrlEnabled {
-					// A committed entry is faulty at apply time. We must not
-					// apply past it (out-of-order application is unsafe) and we
-					// must not panic. Flush what we have, enqueue recovery, and
-					// step down so the synchronous become-leader driver can
-					// repair it cleanly on the next term.
-					r.logger.Error("apply blocked by faulty committed log entry; stepping down to recover",
-						"index", idx, "error", err)
-					if len(batch) != 0 {
-						applyBatch(batch)
-					}
-					var tmp Log
-					_, _ = readLogEntry(r.logs, idx, &tmp)
-					r.requestRecovery(idx, tmp.Term)
-					// Fail any not-yet-applied futures in this group so their
-					// callers don't hang once leaderLoop removes them.
-					for fidx, fut := range futures {
-						if fidx >= idx {
-							fut.respond(ErrLeadershipLost)
-						}
-					}
-					r.setLastApplied(idx - 1)
-					r.setState(Follower)
-					return
-				}
 				r.logger.Error("failed to get log", "index", idx, "error", err)
 				panic(err)
 			}

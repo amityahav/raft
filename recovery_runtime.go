@@ -30,7 +30,7 @@ type recoveryManager struct {
 	inflight map[uint64][]*recoverFuture
 	closed   bool
 
-	workCh   chan uint64
+	workCh   chan FaultyEntry
 	stopCh   chan struct{}
 	commitCh chan struct{}
 	stepDown chan struct{}
@@ -48,7 +48,7 @@ func (r *Raft) startRecovery() {
 	}
 	m := &recoveryManager{
 		inflight: make(map[uint64][]*recoverFuture),
-		workCh:   make(chan uint64, 64),
+		workCh:   make(chan FaultyEntry, 64),
 		stopCh:   make(chan struct{}),
 		commitCh: r.leaderState.commitCh,
 		stepDown: r.leaderState.stepDown,
@@ -117,7 +117,7 @@ func (r *Raft) requestRecovery(index, term uint64) *recoverFuture {
 	// The waiter is registered, so teardown (which drains inflight) will
 	// respond to it even if the worker never sees this send.
 	select {
-	case m.workCh <- index:
+	case m.workCh <- FaultyEntry{Index: index, Term: term}:
 	case <-m.stopCh:
 	}
 	return f
@@ -152,24 +152,23 @@ func (r *Raft) runRecovery(m *recoveryManager) {
 			return
 		case <-r.shutdownCh:
 			return
-		case index := <-m.workCh:
-			r.recoverIndex(m, store, index)
+		case fe := <-m.workCh:
+			r.recoverIndex(m, store, fe.Index, fe.Term)
 		}
 	}
 }
 
-// recoverIndex recovers a single faulty index: re-check the store (another
-// index's recovery may already have fixed it), otherwise query voters. A
-// majority Have repairs in place; anything else steps the leader down so the
+// recoverIndex recovers a single faulty ⟨term, index⟩: re-check the store
+// (another index's recovery may already have fixed it), otherwise query voters.
+// A majority Have repairs in place; anything else steps the leader down so the
 // synchronous become-leader path can drain it safely on the next term.
-func (r *Raft) recoverIndex(m *recoveryManager, store CorruptionAwareLogStore, index uint64) {
+func (r *Raft) recoverIndex(m *recoveryManager, store CorruptionAwareLogStore, index, term uint64) {
 	m.mu.Lock()
-	waiters, ok := m.inflight[index]
+	_, ok := m.inflight[index]
 	m.mu.Unlock()
-	if !ok || len(waiters) == 0 {
+	if !ok {
 		return // already completed or torn down
 	}
-	term := waiters[0].term
 
 	// Re-check: replication to another follower may have already recovered
 	// this exact index, or a truncation may have removed it entirely.
