@@ -468,6 +468,7 @@ func (r *Raft) setupLeaderState() {
 // the leaderLoop for the hot loop.
 func (r *Raft) runLeader() {
 	r.logger.Info("entering leader state", "leader", r)
+
 	metrics.IncrCounter([]string{"raft", "state", "leader"}, 1)
 
 	// Notify that we are the leader
@@ -502,6 +503,10 @@ func (r *Raft) runLeader() {
 	// Cleanup state on step down
 	defer func() {
 		close(stopCh)
+
+		// Stop the runtime recovery poller before tearing down
+		// replication state below.
+		r.stopRecovery()
 
 		// Since we were the leader previously, we update our
 		// last contact time when we step down, so that we are not
@@ -559,6 +564,11 @@ func (r *Raft) runLeader() {
 			}
 		}
 	}()
+
+	// Spawn the runtime recovery worker before replication so a replicator
+	// that immediately hits a faulty log sees a live manager and a current
+	// voter/quorum snapshot. No-op unless CTRL is enabled.
+	r.startRecovery()
 
 	// Start a replication routine for each peer
 	r.startStopReplication()
@@ -688,6 +698,10 @@ func (r *Raft) leaderLoop() {
 		case <-r.leaderState.stepDown:
 			r.mainThreadSaturation.working()
 			r.setState(Follower)
+
+		case index := <-r.recoveryDiscardCh():
+			r.mainThreadSaturation.working()
+			r.handleRecoverDiscard(index)
 
 		case future := <-r.leadershipTransferCh:
 			r.mainThreadSaturation.working()
@@ -821,12 +835,16 @@ func (r *Raft) leaderLoop() {
 				lastIdxInGroup = idx
 			}
 
-			// Process the group
+			// Process the group. A CTRL apply hole stops before the
+			// faulty index; leave those inflight entries queued so a
+			// later commitCh (after the poller repairs) can retry.
 			if len(groupReady) != 0 {
-				r.processLogs(lastIdxInGroup, groupFutures)
+				appliedThrough := r.processLogs(lastIdxInGroup, groupFutures)
 
 				for _, e := range groupReady {
-					r.leaderState.inflight.Remove(e)
+					if e.Value.(*logFuture).log.Index <= appliedThrough {
+						r.leaderState.inflight.Remove(e)
+					}
 				}
 			}
 
@@ -1237,6 +1255,9 @@ func (r *Raft) appendConfigurationEntry(future *configurationChangeFuture) {
 	index := future.Index()
 	r.setLatestConfiguration(configuration, index)
 	r.leaderState.commitment.setConfiguration(configuration)
+	// Publish the new voter set before starting replicators for added peers,
+	// so an on-demand RecoverEntry round does not use the previous quorum.
+	r.syncRecoveryMembership()
 	r.startStopReplication()
 }
 
@@ -1293,12 +1314,15 @@ func (r *Raft) dispatchLogs(applyLogs []*logFuture) {
 // pass futures=nil.
 // Leaders call this when entries are committed. They pass the futures from any
 // inflight logs.
-func (r *Raft) processLogs(index uint64, futures map[uint64]*logFuture) {
+// It returns the highest index that was applied (or skipped as a no-op). With
+// CTRL enabled, a store read failure stops at the hole instead of panicking
+// and returns the index before it.
+func (r *Raft) processLogs(index uint64, futures map[uint64]*logFuture) uint64 {
 	// Reject logs we've applied already
 	lastApplied := r.getLastApplied()
 	if index <= lastApplied {
 		r.logger.Warn("skipping application of old log", "index", index)
-		return
+		return lastApplied
 	}
 
 	applyBatch := func(batch []*commitTuple) {
@@ -1330,6 +1354,17 @@ func (r *Raft) processLogs(index uint64, futures map[uint64]*logFuture) {
 			l := new(Log)
 			if err := r.logs.GetLog(idx, l); err != nil {
 				r.logger.Error("failed to get log", "index", idx, "error", err)
+				if r.ctrlEnabled {
+					// Stop at the hole. The leader poller repairs
+					// GetFaultyEntries and nudges commitCh; do not
+					// apply or respond inflight at/after this index.
+					if len(batch) != 0 {
+						applyBatch(batch)
+					}
+					appliedThrough := idx - 1
+					r.setLastApplied(appliedThrough)
+					return appliedThrough
+				}
 				panic(err)
 			}
 			preparedLog = r.prepareLog(l, nil)
@@ -1360,6 +1395,7 @@ func (r *Raft) processLogs(index uint64, futures map[uint64]*logFuture) {
 
 	// Update the lastApplied index and term
 	r.setLastApplied(index)
+	return index
 }
 
 // processLog is invoked to process the application of a single committed log entry.

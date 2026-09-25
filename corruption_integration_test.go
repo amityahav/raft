@@ -75,6 +75,7 @@ func TestCTRL_NewRaftBootsWithCorruptionAwareStores(t *testing.T) {
 	r, err := NewRaft(conf, &MockFSM{}, logs, stable, snaps, trans)
 	require.NoError(t, err)
 	require.NotNil(t, r)
+	assert.True(t, r.ctrlEnabled, "FileLogStore + ChunkedFileSnapshotStore + InmemTransport must enable CTRL")
 
 	// Boot must succeed and the node must reach a stable running state.
 	require.Eventually(t, func() bool {
@@ -82,4 +83,30 @@ func TestCTRL_NewRaftBootsWithCorruptionAwareStores(t *testing.T) {
 	}, 5*time.Second, 10*time.Millisecond, "single node should elect itself leader")
 
 	require.NoError(t, r.Shutdown().Error())
+}
+
+func TestCTRL_DisabledUnlessAllStoresAndTransportSupportIt(t *testing.T) {
+	dir := t.TempDir()
+	conf := DefaultConfig()
+	conf.LocalID = "ctrl-node"
+	conf.Logger = newTestLogger(t)
+	conf.skipStartup = true
+
+	logs, err := NewFileLogStore(filepath.Join(dir, "logs"), DefaultFileLogStoreConfig())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = logs.Close() })
+
+	_, trans := NewInmemTransport(NewInmemAddr())
+	cfg := Configuration{Servers: []Server{{
+		Suffrage: Voter, ID: conf.LocalID, Address: trans.LocalAddr(),
+	}}}
+
+	// FileLogStore + plain FileSnapshotStore + InmemTransport: missing chunked snaps.
+	plainSnaps, err := NewFileSnapshotStoreWithLogger(dir, 3, newTestLogger(t))
+	require.NoError(t, err)
+	require.NoError(t, BootstrapCluster(conf, logs, NewInmemStore(), plainSnaps, trans, cfg))
+	r, err := NewRaft(conf, &MockFSM{}, logs, NewInmemStore(), plainSnaps, trans)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = r.Shutdown().Error() })
+	assert.False(t, r.ctrlEnabled)
 }
