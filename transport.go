@@ -76,6 +76,19 @@ type WithPreVote interface {
 	RequestPreVote(id ServerID, target ServerAddress, args *RequestPreVoteRequest, resp *RequestPreVoteResponse) error
 }
 
+// WithRecovery is an interface that a transport may provide which
+// allows a transport to support RecoverEntry requests used by CTRL
+// (corruption-tolerant replication).
+//
+// It is defined separately from Transport so existing implementations
+// remain valid; capability is detected via type assertion, the same
+// pattern as WithPreVote.
+type WithRecovery interface {
+	// RecoverEntry asks the target node whether it has a healthy copy of
+	// the log entry identified by args.Index and args.Term.
+	RecoverEntry(id ServerID, target ServerAddress, args *RecoverEntryRequest, resp *RecoverEntryResponse) error
+}
+
 // WithClose is an interface that a transport may provide which
 // allows a transport to be shut down cleanly when a Raft instance
 // shuts down.
@@ -91,10 +104,11 @@ type WithClose interface {
 // LoopbackTransport is an interface that provides a loopback transport suitable for testing
 // e.g. InmemTransport. It's there so we don't have to rewrite tests.
 type LoopbackTransport interface {
-	Transport   // Embedded transport reference
-	WithPeers   // Embedded peer management
-	WithClose   // with a close routine
-	WithPreVote // with a prevote
+	Transport    // Embedded transport reference
+	WithPeers    // Embedded peer management
+	WithClose    // with a close routine
+	WithPreVote  // with a prevote
+	WithRecovery // with CTRL RecoverEntry
 }
 
 // WithPeers is an interface that a transport may provide which allows for connection and

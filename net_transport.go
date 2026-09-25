@@ -25,6 +25,7 @@ const (
 	rpcInstallSnapshot
 	rpcTimeoutNow
 	rpcRequestPreVote
+	rpcRecoverEntry
 
 	// DefaultTimeoutScale is the default TimeoutScale in a NetworkTransport.
 	DefaultTimeoutScale = 256 * 1024 // 256KB
@@ -477,6 +478,11 @@ func (n *NetworkTransport) RequestPreVote(id ServerID, target ServerAddress, arg
 	return n.genericRPC(id, target, rpcRequestPreVote, args, resp)
 }
 
+// RecoverEntry implements WithRecovery.
+func (n *NetworkTransport) RecoverEntry(id ServerID, target ServerAddress, args *RecoverEntryRequest, resp *RecoverEntryResponse) error {
+	return n.genericRPC(id, target, rpcRecoverEntry, args, resp)
+}
+
 // genericRPC handles a simple request/response RPC.
 func (n *NetworkTransport) genericRPC(id ServerID, target ServerAddress, rpcType uint8, args interface{}, resp interface{}) error {
 	// Get a conn
@@ -710,6 +716,13 @@ func (n *NetworkTransport) handleCommand(r *bufio.Reader, dec *codec.Decoder, en
 		}
 		rpc.Command = &req
 		labels = []metrics.Label{{Name: "rpcType", Value: "TimeoutNow"}}
+	case rpcRecoverEntry:
+		var req RecoverEntryRequest
+		if err := dec.Decode(&req); err != nil {
+			return err
+		}
+		rpc.Command = &req
+		labels = []metrics.Label{{Name: "rpcType", Value: "RecoverEntry"}}
 	default:
 		return fmt.Errorf("unknown rpc type %d", rpcType)
 	}

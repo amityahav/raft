@@ -221,3 +221,39 @@ type TimeoutNowResponse struct {
 func (r *TimeoutNowResponse) GetRPCHeader() RPCHeader {
 	return r.RPCHeader
 }
+
+// RecoverEntryRequest is the command used to ask a peer whether it has a
+// healthy copy of the log entry identified by ⟨Term, Index⟩. Used by the
+// CTRL distributed recovery protocol.
+type RecoverEntryRequest struct {
+	RPCHeader
+
+	// Index is the log index of the requested entry.
+	Index uint64
+
+	// Term is the election term that uniquely identifies the requested
+	// entry together with Index.
+	Term uint64
+}
+
+// GetRPCHeader - See WithRPCHeader.
+func (r *RecoverEntryRequest) GetRPCHeader() RPCHeader {
+	return r.RPCHeader
+}
+
+// RecoverEntryResponse is the response to RecoverEntryRequest.
+type RecoverEntryResponse struct {
+	RPCHeader
+
+	// Result is Have, DontHave, or HaveFaulty.
+	Result RecoveryResponse
+
+	// Entry is populated only when Result is Have. It is the correct
+	// log entry the requester can use to repair its copy.
+	Entry *Log
+}
+
+// GetRPCHeader - See WithRPCHeader.
+func (r *RecoverEntryResponse) GetRPCHeader() RPCHeader {
+	return r.RPCHeader
+}
