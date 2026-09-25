@@ -157,27 +157,6 @@ type CorruptionAwareLogStore interface {
 	// Returns an error if the entry at the given index is not currently
 	// marked as faulty, or if the write fails.
 	RepairEntry(log *Log) error
-
-	// DisentangleCrashCorruption scans the log to separate entries
-	// that are faulty due to crash-induced partial writes from entries
-	// that are genuinely corrupted by storage faults.
-	//
-	// Crash-induced partial writes (entry written but persist record
-	// absent) are safe to discard — the node never acknowledged them.
-	// Genuine corruptions (persist record present but data mismatches
-	// checksum) must be reported for distributed recovery.
-	//
-	// This method is intended to be called once during store
-	// initialization (recovery on open). It returns:
-	//   - lastSafeIndex: the index of the last entry that is either
-	//     intact or genuinely corrupted (i.e., the point after which
-	//     crash-induced partial writes were discarded).
-	//   - faultyEntries: entries that are genuinely corrupted and
-	//     require distributed recovery.
-	//
-	// After this call, the store's faulty set is populated with the
-	// returned faultyEntries.
-	DisentangleCrashCorruption() (lastSafeIndex uint64, faultyEntries []FaultyEntry, err error)
 }
 
 // ChunkedSnapshotStore extends SnapshotStore with chunk-level integrity
