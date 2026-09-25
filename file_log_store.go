@@ -19,6 +19,71 @@ import (
 	"github.com/hashicorp/go-msgpack/v2/codec"
 )
 
+// FileLogStore (CLSTORE) layout
+//
+// Each segment file is preallocated and split into a fixed identifier region
+// and a variable data region so that a fault in e_i does not also destroy
+// the persist record p_i that names it (⟨term, index⟩). Slot i holds the
+// identifier for log index (baseIndex + i).
+//
+//	offset 0
+//	┌──────────────────────────────────────────────────────────────┐
+//	│ segment header (64B, immutable)                              │
+//	│   magic | version | baseIndex | maxEntries | dataRegionOff   │
+//	├──────────────────────────────────────────────────────────────┤
+//	│ identifier region  (maxEntries × 32B)                        │
+//	│   slot: [Term:8][Index:8][DataOff:4][DataLen:4][Flags:4]     │
+//	│         [CRC32:4]                                            │
+//	│   p_i / id_i is a persist record: written after e_i, and     │
+//	│   assumed to be written atomically (32B). A torn identifier  │
+//	│   is out of the crash model; a CRC failure here is treated   │
+//	│   as identifier corruption.                                  │
+//	├──────────────────────────────────────────────────────────────┤
+//	│ data region                                                  │
+//	│   e_i frame: [len:4][msgpack payload][CRC32:4]               │
+//	│   data CRC binds ⟨term, index⟩ so a misdirected valid frame  │
+//	│   cannot pass as a different entry.                          │
+//	└──────────────────────────────────────────────────────────────┘
+//
+// Write order: e_i (data frame) then p_i (identifier). fsync follows a
+// successful batch. An all-zero slot is unwritten; a tombstone is a valid
+// identifier with identifierFlagDeleted.
+//
+// Crash vs corruption (paper §3.3). p_i present ⇒ the entry was acknowledged.
+//
+//	Situation                                      e_i       p_i/id_i      Identification?        Result
+//	---------------------------------------------------------------------------------------------------------------
+//	Normal                                         valid     valid         Yes                    Normal operation
+//
+//	Crash while writing e_i                        bad       absent        N/A                    Crash recovery;
+//	                                                                                              discard partial e_i
+//
+//	e_i bad, p_i valid, e_i is last entry          bad       valid         Yes                    Ambiguous: could be
+//	                                                                                              crash or corruption;
+//	                                                                                              distributed recovery
+//
+//	e_i bad, p_i valid, e_i+1/p_i+1 exists         bad       valid         Yes                    Definitely corruption;
+//	                                                                                              distributed recovery
+//
+//	e_i bad, p_i valid                             bad       valid         Yes                    Distributed protocol
+//	                                                                                              determines commitment
+//	                                                                                              and recovers/discards e_i
+//
+//	e_i valid, p_i corrupted                       valid     bad           Potentially no         Paper does not clearly
+//	                                                                                              specify identifier repair
+//
+//	e_i bad, p_i corrupted                         bad       bad           No                     Crash node to preserve
+//	                                                                                              safety
+//
+//	p_i corrupted during runtime, but in-memory    depends   disk: bad     Yes, using             Persistent corruption
+//	copy is still valid                                      memory: valid in-memory metadata     may remain latent
+//
+//	Restart: p_i fails validation while rebuilding unknown    bad           No reliable            Crash node; cannot safely
+//	the in-memory index                                                    identification         identify the affected entry
+//
+// On open, a non-zero identifier slot whose CRC fails panics (last row):
+// without a trusted p_i we cannot name the entry for distributed recovery.
+
 // --------------------------------------------------------------------------
 // On-disk format constants
 // --------------------------------------------------------------------------
@@ -175,7 +240,8 @@ func (r identifierRecord) isDeleted() bool {
 }
 
 // encodeIdentifier serializes an identifierRecord into a 32-byte on-disk
-// representation with a CRC32 self-check.
+// representation with a CRC32 self-check. The 32-byte slot is assumed to be
+// written atomically (one persist record).
 //
 // On-disk layout (32 bytes):
 //
@@ -192,18 +258,22 @@ func encodeIdentifier(rec identifierRecord) [identifierSlotSize]byte {
 	return buf
 }
 
+func identifierUnwritten(buf [identifierSlotSize]byte) bool {
+	for _, b := range buf {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // decodeIdentifier deserializes a 32-byte on-disk identifier slot.
 // Returns the record and whether the CRC is valid. An all-zero slot
 // (unwritten) returns ok=false, as does a slot whose CRC does not match.
+// Callers that rebuild the in-memory index must panic on the CRC-fail
+// case (non-zero, invalid): that slot cannot be identified.
 func decodeIdentifier(buf [identifierSlotSize]byte) (rec identifierRecord, ok bool) {
-	allZero := true
-	for _, b := range buf {
-		if b != 0 {
-			allZero = false
-			break
-		}
-	}
-	if allZero {
+	if identifierUnwritten(buf) {
 		return identifierRecord{}, false
 	}
 
@@ -431,7 +501,7 @@ func NewFileLogStore(dir string, config FileLogStoreConfig) (*FileLogStore, erro
 	// This is the only segment that can have crash-induced partial writes,
 	// because older segments were finalized with an fsync before rotation.
 	if store.active != nil {
-		if _, _, err := store.DisentangleCrashCorruption(); err != nil {
+		if err := store.disentangleCrashCorruption(); err != nil {
 			return nil, fmt.Errorf("disentangle crash corruption: %w", err)
 		}
 	}
@@ -506,7 +576,7 @@ func (s *FileLogStore) updateGlobalIndexes() {
 func (s *FileLogStore) scanSealedSegments() {
 	for i, seg := range s.segments {
 		if i == len(s.segments)-1 {
-			// Skip the active segment — handled by DisentangleCrashCorruption.
+			// Skip the active segment — handled by disentangleCrashCorruption.
 			break
 		}
 		for idx, rec := range seg.index {
@@ -590,6 +660,8 @@ func (s *FileLogStore) createSegment(baseIndex uint64) (*segment, error) {
 // openSegment opens an existing segment file, reads its immutable header,
 // and scans the entire identifier region to rebuild the in-memory index.
 // Live slots populate the index; tombstones and unwritten slots are skipped.
+// A non-zero slot whose identifier CRC fails panics: without a trusted
+// persist record the entry cannot be named for recovery.
 func openSegment(path string, maxEntries uint32) (*segment, error) {
 	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
 	if err != nil {
@@ -641,7 +713,13 @@ func openSegment(path string, maxEntries uint32) (*segment, error) {
 	for i := uint32(0); i < maxEntries; i++ {
 		copy(slotBuf[:], region[int(i)*identifierSlotSize:])
 		rec, ok := decodeIdentifier(slotBuf)
-		if !ok || rec.isDeleted() {
+		if !ok {
+			if !identifierUnwritten(slotBuf) {
+				panic(fmt.Sprintf("file log store: identifier slot %d in %s failed validation; cannot identify the affected entry", i, path))
+			}
+			continue
+		}
+		if rec.isDeleted() {
 			continue
 		}
 		seg.index[rec.Index] = rec
@@ -676,15 +754,18 @@ func (s *FileLogStore) LastIndex() (uint64, error) {
 // its CRC check.
 func (s *FileLogStore) GetLog(index uint64, log *Log) error {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	if s.closed {
+		s.mu.RUnlock()
 		return ErrStoreNotOpen
 	}
-
 	status, err := s.getLogInternal(index, log)
+	term, idx := log.Term, log.Index
+	s.mu.RUnlock()
 	if err != nil {
 		return err
+	}
+	if status != StatusOK {
+		s.noteFaulty(idx, term, status)
 	}
 	if status == StatusCorrupted {
 		return ErrCorruptedEntry
@@ -850,6 +931,7 @@ func (s *FileLogStore) storeLogEntry(l *Log, written *[]writtenEntry) error {
 	}
 
 	// Write the identifier to the slot addressed by (index - baseIndex).
+	// The 32-byte persist record is assumed to be written atomically, after e_i.
 	rec := identifierRecord{
 		Term:       l.Term,
 		Index:      l.Index,
@@ -962,7 +1044,7 @@ func (s *FileLogStore) DeleteRange(min, max uint64) error {
 				return fmt.Errorf("tombstone slot for index %d: %w", idx, err)
 			}
 			delete(seg.index, idx)
-			delete(s.faultySet, idx)
+			delete(s.faultySet, idx) // so GetFaultyEntries no longer reports this slot
 		}
 
 		seg.recomputeBounds()
@@ -997,13 +1079,28 @@ func (s *FileLogStore) DeleteRange(min, max uint64) error {
 // populated from the physically-separated identifier.
 func (s *FileLogStore) GetLogWithIntegrity(index uint64, log *Log) (IntegrityStatus, error) {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	if s.closed {
+		s.mu.RUnlock()
 		return StatusInaccessible, ErrStoreNotOpen
 	}
+	status, err := s.getLogInternal(index, log)
+	term, idx := log.Term, log.Index
+	s.mu.RUnlock()
+	if err == nil && status != StatusOK {
+		s.noteFaulty(idx, term, status)
+	}
+	return status, err
+}
 
-	return s.getLogInternal(index, log)
+// noteFaulty records a corrupted or inaccessible entry in the faulty set
+// so GetFaultyEntries (and leader recovery) can find it.
+func (s *FileLogStore) noteFaulty(index, term uint64, status IntegrityStatus) {
+	if status == StatusOK {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.faultySet[index] = FaultyEntry{Index: index, Term: term, Status: status}
 }
 
 // GetFaultyEntries returns all log entries currently known to be faulty.
@@ -1091,94 +1188,63 @@ func (s *FileLogStore) RepairEntry(log *Log) error {
 	return nil
 }
 
-// DisentangleCrashCorruption scans the active segment to separate crash-
-// induced partial writes from genuine storage corruption.
-//
-// It reads the identifier region in slot order. Live entries in the
-// contiguous written prefix are verified: a data mismatch there is genuine
-// corruption (the identifier is a persist record proving the entry was
-// durably written), so the entry is added to the faulty set. Tombstones are
-// skipped. The first unwritten slot marks the end of the written region; any
-// live identifier found *after* that gap is a crash-truncated orphan (an
-// interrupted batch whose writes were reordered) and is discarded along with
-// everything from the gap onward, preserving the contiguous-prefix invariant.
-func (s *FileLogStore) DisentangleCrashCorruption() (lastSafeIndex uint64, faultyEntries []FaultyEntry, err error) {
+// disentangleCrashCorruption walks the active segment's identifiers in
+// order. The first unwritten slot is a crash hole: the prefix before it is
+// the durable log, and the suffix from the hole is discarded in one write.
+func (s *FileLogStore) disentangleCrashCorruption() error {
 	if s.active == nil {
-		return 0, nil, nil
+		return nil
 	}
-
 	seg := s.active
 
 	region := make([]byte, int64(seg.maxEntries)*int64(identifierSlotSize))
 	if _, err := seg.file.ReadAt(region, int64(segmentHeaderSize)); err != nil {
-		return 0, nil, fmt.Errorf("read identifier region: %w", err)
+		return fmt.Errorf("read identifier region: %w", err)
 	}
 
-	firstAbsent := int64(-1)
-	hasOrphans := false
-
-	var slotBuf [identifierSlotSize]byte
+	hole := seg.maxEntries
+	var buf [identifierSlotSize]byte
 	for i := uint32(0); i < seg.maxEntries; i++ {
-		copy(slotBuf[:], region[int(i)*identifierSlotSize:])
-		rec, ok := decodeIdentifier(slotBuf)
-
+		copy(buf[:], region[int(i)*identifierSlotSize:])
+		if identifierUnwritten(buf) {
+			hole = i
+			break
+		}
+		rec, ok := decodeIdentifier(buf)
 		if !ok {
-			if firstAbsent < 0 {
-				firstAbsent = int64(i)
-			}
-			continue
+			panic(fmt.Sprintf("file log store: identifier slot %d in %s failed validation; cannot identify the affected entry", i, seg.path))
 		}
-
-		if firstAbsent >= 0 {
-			// A written slot after a gap: crash-truncated orphan.
-			hasOrphans = true
-			continue
-		}
-
 		if rec.isDeleted() {
 			continue
 		}
-
-		status := s.verifyEntryData(seg, rec)
-		if status != StatusOK {
-			fe := FaultyEntry{Index: rec.Index, Term: rec.Term, Status: status}
-			faultyEntries = append(faultyEntries, fe)
-			s.faultySet[rec.Index] = fe
+		if st := s.verifyEntryData(seg, rec); st != StatusOK {
+			s.faultySet[rec.Index] = FaultyEntry{Index: rec.Index, Term: rec.Term, Status: st}
 			s.logger.Warn("faulty entry detected",
-				"index", rec.Index, "term", rec.Term, "status", status)
+				"index", rec.Index, "term", rec.Term, "status", st)
 		}
 	}
 
-	if hasOrphans {
-		boundary := uint64(firstAbsent)
+	if hole < seg.maxEntries {
 		for idx := range seg.index {
-			if idx-seg.baseIndex >= boundary {
+			if idx-seg.baseIndex >= uint64(hole) {
 				delete(seg.index, idx)
 				delete(s.faultySet, idx)
 			}
 		}
-		var zeroBuf [identifierSlotSize]byte
-		for i := uint32(firstAbsent); i < seg.maxEntries; i++ {
-			if _, err := seg.file.WriteAt(zeroBuf[:], seg.slotOffset(i)); err != nil {
-				return 0, nil, fmt.Errorf("clear orphan slot %d: %w", i, err)
-			}
+		suffix := make([]byte, int(seg.maxEntries-hole)*identifierSlotSize)
+		if _, err := seg.file.WriteAt(suffix, seg.slotOffset(hole)); err != nil {
+			return fmt.Errorf("clear identifier suffix from slot %d: %w", hole, err)
 		}
 		seg.recomputeBounds()
 		seg.dataWritePos = seg.deriveDataWritePos()
 		if !s.config.NoSync {
 			if err := seg.file.Sync(); err != nil {
-				return 0, nil, fmt.Errorf("sync after disentanglement: %w", err)
+				return fmt.Errorf("sync after disentanglement: %w", err)
 			}
 		}
-		s.logger.Info("discarded crash-truncated entries", "fromSlot", firstAbsent)
 	}
 
-	lastSafeIndex = seg.maxIndex
-	if lastSafeIndex == 0 && len(s.segments) >= 2 {
-		lastSafeIndex = s.segments[len(s.segments)-2].maxIndex
-	}
-
-	return lastSafeIndex, faultyEntries, nil
+	return nil
 }
 
 // --------------------------------------------------------------------------

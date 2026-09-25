@@ -412,9 +412,9 @@ func TestFileLogStore_DisentangleCrashCorruption_CleanLog(t *testing.T) {
 
 	require.NoError(t, store.StoreLogs(testLogs(1, 10)))
 
-	lastSafe, faulty, err := store.DisentangleCrashCorruption()
+	require.NoError(t, store.disentangleCrashCorruption())
+	faulty, err := store.GetFaultyEntries()
 	require.NoError(t, err)
-	assert.Equal(t, uint64(10), lastSafe)
 	assert.Empty(t, faulty)
 }
 
@@ -431,9 +431,9 @@ func TestFileLogStore_DisentangleCrashCorruption_CrashBoundary(t *testing.T) {
 	require.NoError(t, err)
 	delete(seg.index, 8)
 
-	lastSafe, faulty, err := store.DisentangleCrashCorruption()
+	require.NoError(t, store.disentangleCrashCorruption())
+	faulty, err := store.GetFaultyEntries()
 	require.NoError(t, err)
-	assert.Equal(t, uint64(7), lastSafe)
 	assert.Empty(t, faulty, "crash entries should not appear as corrupted")
 
 	// Entries 8-10 should be discarded, leaving 7 live entries.
@@ -463,9 +463,9 @@ func TestFileLogStore_DisentangleCrashCorruption_CorruptedEntry(t *testing.T) {
 	seg.file.WriteAt(b[:], corruptOff)
 
 	store.faultySet = make(map[uint64]FaultyEntry) // reset
-	lastSafe, faulty, err := store.DisentangleCrashCorruption()
+	require.NoError(t, store.disentangleCrashCorruption())
+	faulty, err := store.GetFaultyEntries()
 	require.NoError(t, err)
-	assert.Equal(t, uint64(10), lastSafe)
 	require.Len(t, faulty, 1)
 	assert.Equal(t, uint64(5), faulty[0].Index)
 	assert.Equal(t, StatusCorrupted, faulty[0].Status)
@@ -553,6 +553,30 @@ func TestFileLogStore_PersistAndReopen_WithCorruption(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, faulty, 1)
 	assert.Equal(t, uint64(10), faulty[0].Index)
+}
+
+func TestFileLogStore_CorruptIdentifierPanicsOnOpen(t *testing.T) {
+	dir, cfg := testConfig(t)
+
+	store1, err := NewFileLogStore(dir, cfg)
+	require.NoError(t, err)
+	require.NoError(t, store1.StoreLogs(testLogs(1, 5)))
+
+	seg := store1.findSegment(3)
+	require.NotNil(t, seg)
+	off := seg.slotOffset(uint32(3 - seg.baseIndex))
+	var slot [identifierSlotSize]byte
+	_, err = seg.file.ReadAt(slot[:], off)
+	require.NoError(t, err)
+	require.False(t, identifierUnwritten(slot))
+	slot[identifierCRCOffset] ^= 0xFF
+	_, err = seg.file.WriteAt(slot[:], off)
+	require.NoError(t, err)
+	require.NoError(t, store1.Close())
+
+	assert.Panics(t, func() {
+		_, _ = NewFileLogStore(dir, cfg)
+	})
 }
 
 func TestFileLogStore_PersistAndReopen_CorruptionInSealedSegment(t *testing.T) {
